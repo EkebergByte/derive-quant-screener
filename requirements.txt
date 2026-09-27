@@ -1,0 +1,25 @@
+# Przetwarzanie danych i macierze
+numpy>=1.26.0
+pandas>=2.2.0
+scipy>=1.12.0
+
+# Połączenia sieciowe i API
+requests>=2.31.0
+httpx>=0.27.0
+websockets>=12.0
+
+# Połączenie Web3 i kryptografia (dla Derive/Arbitrum)
+web3>=6.15.0
+eth-account>=0.11.0
+
+# Walidacja danych i konfiguracja
+pydantic>=2.6.0
+python-dotenv>=1.0.1
+pyyaml>=6.0.1
+
+# Powiadomienia
+python-telegram-bot>=21.0
+
+# Testy i jakość kodu
+pytest>=8.0.0
+pytest-asyncio>=0.23.0

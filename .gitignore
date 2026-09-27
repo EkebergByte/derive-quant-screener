@@ -1,0 +1,41 @@
+# Środowisko Python i kompilacja
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# Zmienne środowiskowe i klucze bezpieczeństwa (KATEGORYCZNY ZAKAZ PUSHOWANIA)
+.env
+.env.local
+*.pem
+*.key
+wallets/
+session_keys.json
+
+# Dane lokalne, cache i bazy
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+*.sqlite3
+*.csv
+
+# Jupyter Notebooks (pliki tymczasowe)
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+# Środowiska IDE i systemowe
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logi operacyjne
+*.log
+logs/
+.env

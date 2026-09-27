@@ -1,0 +1,3388 @@
+﻿==================================================
+PLIK: \DUMP_KOMENDA.txt
+==================================================
+$p = "C:\Programming\GitHubRepo\derive-quant-screener"; Get-ChildItem -Path $p -Recurse -File | Where-Object { $_.FullName -notmatch '\\(\.git|__pycache__|\.venv|venv|\.pytest_cache|\.vscode|data\\raw|\.ipynb_checkpoints)' -and $_.Extension -match '\.(py|toml|yaml|yml|example|txt|md)$' -and $_.Name -ne 'project_code_dump.txt' -and $_.Name -ne 'project_snapshot.txt' } | ForEach-Object { "=================================================="; "PLIK: " + $_.FullName.Substring($p.Length); "=================================================="; Get-Content -LiteralPath $_.FullName -Raw; "`n" } | Out-File -FilePath "$p\project_code_dump.txt" -Encoding utf8
+
+
+==================================================
+PLIK: \pyproject.toml
+==================================================
+
+
+==================================================
+PLIK: \requirements.txt
+==================================================
+# Przetwarzanie danych i macierze
+numpy>=1.26.0
+pandas>=2.2.0
+scipy>=1.12.0
+
+# PoÅ‚Ä…czenia sieciowe i API
+requests>=2.31.0
+httpx>=0.27.0
+websockets>=12.0
+
+# PoÅ‚Ä…czenie Web3 i kryptografia (dla Derive/Arbitrum)
+web3>=6.15.0
+eth-account>=0.11.0
+
+# Walidacja danych i konfiguracja
+pydantic>=2.6.0
+python-dotenv>=1.0.1
+pyyaml>=6.0.1
+
+# Powiadomienia
+python-telegram-bot>=21.0
+
+# Testy i jakoÅ›Ä‡ kodu
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+
+
+==================================================
+PLIK: \src\__init__.py
+==================================================
+
+
+==================================================
+PLIK: \src\data_feed\deribit_client.py
+==================================================
+# Patch dla deribit_client.py
+# 1. ZastÄ…pienie _safe_float mechanizmem _safe_optional_float dla bid/ask/iv.
+# 2. Ujednolicenie ACT/365.0.
+# 3. Zabezpieczenie Å›cieÅ¼ki zapisu pliku.
+
+import os
+import re
+from datetime import datetime, timezone
+from typing import Dict, Any, Optional
+import requests
+import pandas as pd
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+class DeribitClient:
+    MONTH_MAP = {
+        "JAN": "01", "FEB": "02", "MAR": "03", "APR": "04",
+        "MAY": "05", "JUN": "06", "JUL": "07", "AUG": "08",
+        "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12"
+    }
+
+    def __init__(self, base_url: Optional[str] = None):
+        self.base_url = base_url or os.getenv("DERIBIT_API_URL", "https://www.deribit.com/api/v2")
+        self.headers = {
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) DeribitQuant/1.0"
+        }
+
+    @staticmethod
+    def _safe_float(val: Any, default: float = 0.0) -> float:
+        if val is None:
+            return default
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return default
+
+    @staticmethod
+    def _safe_optional_float(val: Any) -> Optional[float]:
+        if val is None or val == "":
+            return None
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return None
+
+    def _send_get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        url = f"{self.base_url}/public/{endpoint}"
+        try:
+            response = requests.get(url, params=params or {}, headers=self.headers, timeout=12)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("result")
+        except requests.exceptions.RequestException as e:
+            print(f"[BLAD DERIBIT] {url} -> {e}")
+            return None
+
+    def get_spot_price(self, underlying: str = "SOL") -> Optional[float]:
+        index_name = f"{underlying.lower()}_usdc"
+        res = self._send_get("get_index_price", {"index_name": index_name})
+        if res and isinstance(res, dict) and "index_price" in res:
+            return self._safe_float(res["index_price"])
+        return None
+
+    def get_historical_volatility(self, currency: str = "SOL") -> Optional[float]:
+        res = self._send_get("get_historical_volatility", {"currency": currency})
+        if res and isinstance(res, list) and len(res) > 0:
+            latest_point = res[-1]
+            if len(latest_point) >= 2:
+                raw_vol = self._safe_float(latest_point[1])
+                return round(raw_vol / 100.0, 4)
+        return None
+
+    def parse_deribit_instrument_name(self, name: str) -> Optional[Dict[str, Any]]:
+        pattern = r"^([A-Z]+_[A-Z]+)-(\d{1,2})([A-Z]{3})(\d{2})-(\d+(?:\.\d+)?)-([CP])$"
+        match = re.match(pattern, name.upper())
+        if not match:
+            return None
+
+        pair, day_str, mon_str, yr_str, strike_str, opt_char = match.groups()
+        mon_num = self.MONTH_MAP.get(mon_str)
+        if not mon_num:
+            return None
+
+        full_year = f"20{yr_str}"
+        full_day = f"{int(day_str):02d}"
+        expiry_str = f"{full_year}{mon_num}{full_day}"
+
+        return {
+            "pair": pair,
+            "expiry_str": expiry_str,
+            "strike": self._safe_float(strike_str),
+            "option_type": "CALL" if opt_char == "C" else "PUT"
+        }
+
+    def get_clean_options_chain(
+        self,
+        underlying: str = "SOL",
+        min_dte: float = 7.0,
+        max_dte: float = 35.0,
+        save_csv: bool = False
+    ) -> pd.DataFrame:
+        raw_items = self._send_get("get_book_summary_by_currency", {
+            "currency": "USDC",
+            "kind": "option"
+        })
+
+        if not raw_items or not isinstance(raw_items, list):
+            return pd.DataFrame()
+
+        current_time_utc = datetime.now(timezone.utc)
+        target_prefix = f"{underlying.upper()}_USDC-"
+        fallback_spot = self.get_spot_price(underlying=underlying)
+
+        records = []
+
+        for item in raw_items:
+            name = item.get("instrument_name", "")
+            if not name.startswith(target_prefix):
+                continue
+
+            parsed = self.parse_deribit_instrument_name(name)
+            if not parsed:
+                continue
+
+            expiry_str = parsed["expiry_str"]
+
+            try:
+                exp_dt = datetime.strptime(f"{expiry_str} 08:00:00", "%Y%m%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                seconds_to_expiry = (exp_dt - current_time_utc).total_seconds()
+            except ValueError:
+                continue
+
+            if seconds_to_expiry <= 0:
+                continue
+
+            dte = seconds_to_expiry / 86400.0
+            if not (min_dte <= dte <= max_dte):
+                continue
+
+            # Standardowa rynkowa konwencja ACT/365.0
+            t_annual = seconds_to_expiry / (365.0 * 86400.0)
+
+            spot_price = self._safe_float(item.get("underlying_price") or item.get("estimated_delivery_price") or fallback_spot)
+            mark_price = self._safe_float(item.get("mark_price"))
+            
+            # PrawidÅ‚owa obsÅ‚uga braku kwotowaÅ„ (None zamiast 0.0)
+            bid_price = self._safe_optional_float(item.get("bid_price"))
+            ask_price = self._safe_optional_float(item.get("ask_price"))
+            
+            raw_mark_iv = self._safe_optional_float(item.get("mark_iv"))
+            mark_iv = round(raw_mark_iv / 100.0, 4) if raw_mark_iv is not None else None
+
+            oi = self._safe_float(item.get("open_interest"))
+            volume = self._safe_float(item.get("volume"))
+
+            records.append({
+                "instrument_name": name,
+                "currency": underlying,
+                "expiry_str": expiry_str,
+                "dte": round(dte, 4),
+                "T": round(t_annual, 6),
+                "strike": parsed["strike"],
+                "option_type": parsed["option_type"],
+                "spot_price": spot_price,
+                "bid": bid_price,
+                "ask": ask_price,
+                "mark": mark_price,
+                "iv": mark_iv,
+                "oi": oi,
+                "volume_24h": volume
+            })
+
+        df = pd.DataFrame(records)
+        if not df.empty:
+            df.sort_values(by=["dte", "strike", "option_type"], inplace=True)
+            df.reset_index(drop=True, inplace=True)
+
+            if save_csv:
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+                output_dir = os.path.abspath(os.path.join(base_dir, "..", "..", "data", "raw"))
+                os.makedirs(output_dir, exist_ok=True)
+                csv_path = os.path.join(output_dir, "deribit_sol_options_latest.csv")
+                df.to_csv(csv_path, index=False)
+
+        return df
+
+
+if __name__ == "__main__":
+    print("Inicjalizacja oczyszczonego klienta Deribit...")
+    client = DeribitClient()
+
+    spot = client.get_spot_price("SOL")
+    print(f"[OK] Kurs indeksowy SOL z Deribit: {spot} USD")
+
+    rv = client.get_historical_volatility("SOL")
+    if rv:
+        print(f"[OK] Oficjalna kroczaca zmiennosc zrealizowana (RV) SOL: {rv * 100:.2f}%")
+
+    MIN_DTE = 7.0
+    MAX_DTE = 35.0
+
+    print(f"\nPobieranie benchmarkowych opcji na SOL z Deribit (DTE: {MIN_DTE} - {MAX_DTE} dni)...")
+    df_deribit = client.get_clean_options_chain("SOL", min_dte=MIN_DTE, max_dte=MAX_DTE, save_csv=True)
+
+    print(f"[SUKCES] Pobrano {len(df_deribit)} czystych opcji z Deribit!")
+
+    if not df_deribit.empty:
+        expiries = df_deribit["expiry_str"].unique()
+        print(f"Dostepne serie wygasania: {list(expiries)}")
+
+        first_exp = expiries[0]
+        print(f"\nOpcje At-The-Money (Strike 115 - 125 USD) dla serii {first_exp}:")
+        atm_view = df_deribit[
+            (df_deribit["expiry_str"] == first_exp) &
+            (df_deribit["strike"] >= 115) & 
+            (df_deribit["strike"] <= 125)
+        ]
+        print(atm_view[["instrument_name", "strike", "option_type", "bid", "ask", "mark", "iv", "oi", "volume_24h"]])
+
+
+==================================================
+PLIK: \src\data_feed\derive_client.py
+==================================================
+import os
+import time
+from typing import Dict, Any, List, Optional, Tuple
+import requests
+import pandas as pd
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+class DeriveClient:
+    """
+    Autonomiczny, defensywny klient danych rynkowych dla gieldy Derive.xyz (Lyra v2/v3).
+    Dziala bezobslugowo w chmurze, mapuje dynamiczny kalendarz DTE i przetwarza jednoliterowa telemetrie.
+    """
+
+    def __init__(self, base_url: Optional[str] = None):
+        self.base_url = base_url or os.getenv("DERIVE_API_BASE_URL", "https://api.lyra.finance")
+        self.headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) DeriveQuant/1.0"
+        }
+
+    @staticmethod
+    def _safe_float(val: Any, default: float = 0.0) -> float:
+        if val is None:
+            return default
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return default
+
+    def _send_post(self, method: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        url = f"{self.base_url}/public/{method}"
+        payload = params or {}
+
+        try:
+            response = requests.post(url, json=payload, headers=self.headers, timeout=12)
+            response.raise_for_status()
+            data = response.json()
+            
+            if "result" in data:
+                return data["result"]
+            return data
+        except requests.exceptions.RequestException as e:
+            print(f"[BLAD SIECIOWY] {url} -> {e}")
+            return None
+
+    def get_spot_price(self, currency: str = "SOL") -> Optional[float]:
+        """
+        Pobiera biezacy kurs referencyjny z kontraktu wieczystego SOL-PERP.
+        """
+        ticker = self._send_post("get_ticker", {"instrument_name": f"{currency}-PERP"})
+        if ticker and isinstance(ticker, dict):
+            idx_price = ticker.get("index_price") or ticker.get("mark_price") or ticker.get("I")
+            if idx_price is not None:
+                return self._safe_float(idx_price)
+        return None
+
+    def get_all_active_expiries_with_dte(self, currency: str = "SOL") -> List[Tuple[str, float]]:
+        """
+        Pobiera z gieldy pelen harmonogram i wylicza dokladne DTE dla kazdej serii.
+        """
+        instruments = self._send_post("get_instruments", {
+            "currency": currency,
+            "instrument_type": "option",
+            "expired": False
+        })
+        
+        if not instruments or not isinstance(instruments, list):
+            return []
+
+        current_time_sec = time.time()
+        expiry_map = {}
+
+        for inst in instruments:
+            if not isinstance(inst, dict):
+                continue
+            name = inst.get("instrument_name", "")
+            parts = name.split("-")
+            if len(parts) >= 2 and len(parts[1]) == 8 and parts[1].isdigit():
+                exp_str = parts[1]
+                if exp_str not in expiry_map:
+                    opt_details = inst.get("option_details", {})
+                    exp_ts = opt_details.get("expiry") if isinstance(opt_details, dict) else None
+                    if not exp_ts:
+                        exp_ts = inst.get("scheduled_deactivation", 0)
+                    
+                    exp_ts_sec = self._safe_float(exp_ts)
+                    dte = (exp_ts_sec - current_time_sec) / 86400.0
+                    if dte > 0:
+                        expiry_map[exp_str] = round(dte, 2)
+
+        return sorted(expiry_map.items(), key=lambda x: x[1])
+
+    def get_target_expiries(self, currency: str = "SOL", min_dte: float = 7.0, max_dte: float = 35.0) -> List[str]:
+        """
+        Filtruje serie, wybierajac tylko te z okna inwestycyjnego [min_dte, max_dte].
+        """
+        all_expiries = self.get_all_active_expiries_with_dte(currency=currency)
+        return [exp_str for exp_str, dte in all_expiries if min_dte <= dte <= max_dte]
+
+    def _normalize_tickers(self, raw_response: Any) -> List[Dict[str, Any]]:
+        """
+        Konwertuje odpowiedz API do listy slownikow z przypisana nazwa instrumentu.
+        """
+        if not raw_response:
+            return []
+
+        data = raw_response
+        if isinstance(data, dict):
+            if "tickers" in data:
+                data = data["tickers"]
+            elif "result" in data:
+                data = data["result"]
+
+        normalized = []
+
+        if isinstance(data, dict):
+            for key, val in data.items():
+                if isinstance(val, dict):
+                    if "instrument_name" not in val:
+                        val["instrument_name"] = str(key)
+                    normalized.append(val)
+                elif isinstance(val, list):
+                    for sub_val in val:
+                        if isinstance(sub_val, dict):
+                            normalized.append(sub_val)
+        elif isinstance(data, list):
+            for elem in data:
+                if isinstance(elem, dict):
+                    normalized.append(elem)
+
+        return normalized
+
+    def get_tickers_for_expiry(self, expiry_date: str, currency: str = "SOL") -> List[Dict[str, Any]]:
+        """
+        Pobiera znormalizowane tickery dla konkretnej daty YYYYMMDD.
+        """
+        res = self._send_post("get_tickers", {
+            "currency": currency,
+            "instrument_type": "option",
+            "expiry_date": expiry_date
+        })
+        return self._normalize_tickers(res)
+
+    def get_clean_options_chain(
+        self,
+        currency: str = "SOL",
+        min_dte: float = 7.0,
+        max_dte: float = 35.0,
+        specific_expiry: Optional[str] = None
+    ) -> pd.DataFrame:
+        """
+        Glowna metoda analityczna. Zwraca standaryzowana tabele opcji ze wszystkimi grekami.
+        """
+        spot_price = self.get_spot_price(currency=currency)
+        all_expiries = self.get_all_active_expiries_with_dte(currency=currency)
+        exp_dte_map = dict(all_expiries)
+
+        if specific_expiry:
+            target_expiries = [specific_expiry]
+        else:
+            target_expiries = [exp_str for exp_str, dte in all_expiries if min_dte <= dte <= max_dte]
+
+        if not target_expiries:
+            print(f"[INFO] Brak serii w zadanym oknie DTE ({min_dte} - {max_dte} dni) dla {currency}.")
+            return pd.DataFrame()
+
+        records = []
+
+        for exp in target_expiries:
+            dte = exp_dte_map.get(exp, 0.0)
+            t_annual = dte / 365.25
+            
+            tickers = self.get_tickers_for_expiry(expiry_date=exp, currency=currency)
+
+            for item in tickers:
+                if not isinstance(item, dict):
+                    continue
+
+                instrument_name = item.get("instrument_name", "")
+                parts = str(instrument_name).split("-")
+                if len(parts) < 4:
+                    continue
+
+                try:
+                    strike = self._safe_float(parts[2])
+                    opt_type = "CALL" if parts[3].upper() == "C" else "PUT"
+                except (ValueError, IndexError):
+                    continue
+
+                # Sub-obiekty telemetrii
+                pricing = item.get("option_pricing")
+                if not isinstance(pricing, dict):
+                    pricing = {}
+
+                stats = item.get("stats")
+                if not isinstance(stats, dict):
+                    stats = {}
+
+                # Mapowanie cen: pelne nazwy ORAZ skroty Derive ('b', 'a', 'M', 'I')
+                bid_price = self._safe_float(item.get("b") or item.get("best_bid_price"))
+                ask_price = self._safe_float(item.get("a") or item.get("best_ask_price"))
+                mark_price = self._safe_float(item.get("M") or pricing.get("m") or item.get("mark_price"))
+
+                # Mapowanie grek i zmiennosci z sub-obiektu option_pricing ('d', 'g', 't', 'v', 'i')
+                delta = self._safe_float(pricing.get("d") or pricing.get("delta") or item.get("delta"))
+                gamma = self._safe_float(pricing.get("g") or pricing.get("gamma") or item.get("gamma"))
+                theta = self._safe_float(pricing.get("t") or pricing.get("theta") or item.get("theta"))
+                vega = self._safe_float(pricing.get("v") or pricing.get("vega") or item.get("vega"))
+                iv = self._safe_float(pricing.get("i") or pricing.get("iv") or item.get("mark_iv"))
+                
+                # Otwarte pozycje z pod-obiektu stats
+                oi = self._safe_float(stats.get("oi") or item.get("open_interest"))
+
+                records.append({
+                    "instrument_name": instrument_name,
+                    "currency": currency,
+                    "expiry_str": exp,
+                    "dte": dte,
+                    "T": round(t_annual, 6),
+                    "strike": strike,
+                    "option_type": opt_type,
+                    "spot_price": spot_price,
+                    "bid": bid_price,
+                    "ask": ask_price,
+                    "mark": mark_price,
+                    "iv": round(iv, 4),
+                    "delta": round(delta, 4),
+                    "gamma": round(gamma, 6),
+                    "theta": round(theta, 4),
+                    "vega": round(vega, 4),
+                    "oi": oi
+                })
+
+        df = pd.DataFrame(records)
+        if not df.empty:
+            df.sort_values(by=["dte", "strike", "option_type"], inplace=True)
+            df.reset_index(drop=True, inplace=True)
+
+        return df
+
+
+if __name__ == "__main__":
+    print("Inicjalizacja zintegrowanego klienta Derive...")
+    client = DeriveClient()
+
+    spot = client.get_spot_price("SOL")
+    print(f"[OK] Biezacy kurs referencyjny SOL: {spot} USD")
+
+    MIN_DTE = 7.0
+    MAX_DTE = 35.0
+
+    df_chain = client.get_clean_options_chain("SOL", min_dte=MIN_DTE, max_dte=MAX_DTE)
+    print(f"[SUKCES] Pobrano i znormalizowano w pamieci RAM {len(df_chain)} opcji!")
+
+    if not df_chain.empty:
+        first_expiry = df_chain["expiry_str"].iloc[0]
+        print(f"\nPodglad opcji w okolicach ATM (Strike 115 - 125 USD) dla serii {first_expiry}:")
+        atm_view = df_chain[
+            (df_chain["expiry_str"] == first_expiry) &
+            (df_chain["strike"] >= 115) & 
+            (df_chain["strike"] <= 125)
+        ]
+        print(atm_view[["instrument_name", "strike", "option_type", "bid", "ask", "mark", "iv", "delta", "gamma", "theta", "oi"]])
+
+
+==================================================
+PLIK: \src\data_feed\market_spot.py
+==================================================
+# Patch dla market_spot.py
+# 1. Odrzucenie bieÅ¼Ä…cej otwartej Å›wiecy (incomplete candle pruning).
+# 2. Poprawna kolejnoÅ›Ä‡ sortowania przed ciÄ™ciem limitu w fallbacku Coinbase.
+# 3. Zabezpieczenie ciÄ…gÅ‚oÅ›ci szeregu czasowego.
+
+import os
+import time
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any
+import requests
+import pandas as pd
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+class MarketSpotClient:
+    def __init__(self):
+        self.binance_spot_url = os.getenv("BINANCE_API_URL", "https://api.binance.com")
+        self.binance_fapi_url = "https://fapi.binance.com"
+        self.coinbase_url = "https://api.exchange.coinbase.com"
+        self.deribit_url = "https://www.deribit.com/api/v2/public"
+        self.treasury_api_url = "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v2/accounting/od/avg_interest_rates"
+        self.headers = {
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SpotFeed/1.0"
+        }
+
+    @staticmethod
+    def _safe_float(val: Any, default: float = 0.0) -> float:
+        if val is None:
+            return default
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return default
+
+    def _fetch_binance_klines(self, symbol: str = "SOLUSDC", interval: str = "1h", limit: int = 168) -> Optional[pd.DataFrame]:
+        url = f"{self.binance_spot_url}/api/v3/klines"
+        # Pobieramy limit + 1, aby mÃ³c bezpiecznie odrzuciÄ‡ ostatniÄ…, niepeÅ‚nÄ… Å›wiecÄ™
+        params = {"symbol": symbol, "interval": interval, "limit": min(limit + 1, 1000)}
+
+        try:
+            response = requests.get(url, params=params, headers=self.headers, timeout=10)
+            if response.status_code == 200:
+                raw_data = response.json()
+                if not raw_data or not isinstance(raw_data, list):
+                    return None
+
+                records = []
+                current_time_ms = time.time() * 1000.0
+
+                for k in raw_data:
+                    open_time = self._safe_float(k[0])
+                    close_time = self._safe_float(k[6])
+
+                    # Ignorujemy Å›wiecÄ™, ktÃ³ra nie zostaÅ‚a jeszcze ostatecznie zamkniÄ™ta
+                    if close_time > current_time_ms:
+                        continue
+
+                    records.append({
+                        "timestamp": datetime.fromtimestamp(open_time / 1000.0, tz=timezone.utc),
+                        "open": self._safe_float(k[1]),
+                        "high": self._safe_float(k[2]),
+                        "low": self._safe_float(k[3]),
+                        "close": self._safe_float(k[4]),
+                        "volume": self._safe_float(k[5])
+                    })
+
+                df = pd.DataFrame(records)
+                if not df.empty:
+                    df.sort_values(by="timestamp", inplace=True)
+                    df = df.tail(limit).reset_index(drop=True)
+                return df
+            return None
+        except requests.exceptions.RequestException:
+            return None
+
+    def _fetch_coinbase_candles(self, product_id: str = "SOL-USD", granularity: int = 3600, limit: int = 168) -> Optional[pd.DataFrame]:
+        url = f"{self.coinbase_url}/products/{product_id}/candles"
+        params = {"granularity": granularity}
+
+        try:
+            response = requests.get(url, params=params, headers=self.headers, timeout=10)
+            if response.status_code == 200:
+                raw_data = response.json()
+                if not raw_data or not isinstance(raw_data, list):
+                    return None
+
+                records = []
+                current_time_sec = time.time()
+
+                for k in raw_data:
+                    candle_time = self._safe_float(k[0])
+                    # Odrzucenie bieÅ¼Ä…cej trwajÄ…cej Å›wiecy
+                    if candle_time + granularity > current_time_sec:
+                        continue
+
+                    records.append({
+                        "timestamp": datetime.fromtimestamp(candle_time, tz=timezone.utc),
+                        "open": self._safe_float(k[3]),
+                        "high": self._safe_float(k[2]),
+                        "low": self._safe_float(k[1]),
+                        "close": self._safe_float(k[4]),
+                        "volume": self._safe_float(k[5])
+                    })
+
+                df = pd.DataFrame(records)
+                if not df.empty:
+                    # KRYTYCZNE: Sortowanie chronologiczne PRZED wywoÅ‚aniem tail(limit)
+                    df.sort_values(by="timestamp", inplace=True)
+                    df = df.tail(limit).reset_index(drop=True)
+                return df
+            return None
+        except requests.exceptions.RequestException:
+            return None
+
+    def get_clean_spot_candles(
+        self,
+        symbol: str = "SOLUSDC",
+        interval: str = "1h",
+        limit: int = 168,
+        save_csv: bool = False
+    ) -> pd.DataFrame:
+        df = self._fetch_binance_klines(symbol=symbol, interval=interval, limit=limit)
+        
+        if df is None or df.empty:
+            product_id = "SOL-USD"
+            granularity = 3600 if interval == "1h" else 86400
+            df = self._fetch_coinbase_candles(product_id=product_id, granularity=granularity, limit=limit)
+
+        if df is None or df.empty:
+            print("[BLAD] Nie udalo sie pobrac swiec spotowych z zadnego zrodla.")
+            return pd.DataFrame()
+
+        df.sort_values(by="timestamp", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+
+        if save_csv:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            output_dir = os.path.abspath(os.path.join(base_dir, "..", "..", "data", "raw"))
+            os.makedirs(output_dir, exist_ok=True)
+            csv_path = os.path.join(output_dir, "spot_candles_latest.csv")
+            df.to_csv(csv_path, index=False)
+
+        return df
+
+    def _fetch_binance_funding_rate(self, symbol: str = "SOLUSDT") -> Optional[Dict[str, Any]]:
+        url = f"{self.binance_fapi_url}/fapi/v1/fundingRate"
+        params = {"symbol": symbol, "limit": 1}
+
+        try:
+            response = requests.get(url, params=params, headers=self.headers, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if isinstance(data, list) and len(data) > 0:
+                    latest = data[-1]
+                    rate = self._safe_float(latest.get("fundingRate"))
+                    funding_time_ms = self._safe_float(latest.get("fundingTime"))
+                    # Konwencja ACT/365: 3 okresy fundingowe dziennie
+                    return {
+                        "source": "binance_futures",
+                        "symbol": symbol,
+                        "funding_rate": round(rate, 6),
+                        "annualized_rate": round(rate * 3.0 * 365.0, 4),
+                        "timestamp": datetime.fromtimestamp(funding_time_ms / 1000.0, tz=timezone.utc)
+                    }
+            return None
+        except requests.exceptions.RequestException:
+            return None
+
+    def _fetch_deribit_funding_rate(self, instrument_name: str = "SOL_USDC-PERPETUAL") -> Optional[Dict[str, Any]]:
+        url = f"{self.deribit_url}/ticker"
+        params = {"instrument_name": instrument_name}
+
+        try:
+            response = requests.get(url, params=params, headers=self.headers, timeout=10)
+            if response.status_code == 200:
+                result = response.json().get("result", {})
+                rate = self._safe_float(result.get("current_funding") or result.get("funding_8h"))
+                ts_ms = self._safe_float(result.get("timestamp"))
+                return {
+                    "source": "deribit_perpetual",
+                    "symbol": instrument_name,
+                    "funding_rate": round(rate, 6),
+                    "annualized_rate": round(rate * 3.0 * 365.0, 4),
+                    "timestamp": datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+                }
+            return None
+        except requests.exceptions.RequestException:
+            return None
+
+    def get_current_funding_rate(self, symbol: str = "SOLUSDT") -> Dict[str, Any]:
+        res = self._fetch_binance_funding_rate(symbol=symbol)
+        if res:
+            return res
+
+        res_deribit = self._fetch_deribit_funding_rate(instrument_name="SOL_USDC-PERPETUAL")
+        if res_deribit:
+            return res_deribit
+
+        return {
+            "source": "none",
+            "symbol": symbol,
+            "funding_rate": 0.0,
+            "annualized_rate": 0.0,
+            "timestamp": datetime.now(timezone.utc)
+        }
+
+    def get_us_treasury_risk_free_rate(self) -> float:
+        params = {
+            "filter": "security_desc:eq:Treasury Bills",
+            "sort": "-record_date",
+            "page[size]": "1"
+        }
+
+        try:
+            response = requests.get(self.treasury_api_url, params=params, headers=self.headers, timeout=10)
+            if response.status_code == 200:
+                data = response.json().get("data", [])
+                if data and len(data) > 0:
+                    rate_pct = self._safe_float(data[0].get("avg_interest_rate_amt"))
+                    if rate_pct > 0.0:
+                        return round(rate_pct / 100.0, 4)
+        except requests.exceptions.RequestException:
+            pass
+
+        return 0.045
+
+
+if __name__ == "__main__":
+    print("Inicjalizacja MarketSpotClient...")
+    client = MarketSpotClient()
+
+    print("\n--- POBIERANIE OFICJALNEJ STOPY U.S. TREASURY (T-BILLS) ---")
+    r_treasury = client.get_us_treasury_risk_free_rate()
+    print(f"[OK] Dynamiczna stopa wolna od ryzyka z U.S. Treasury: {r_treasury * 100:.2f}% (r = {r_treasury})")
+
+    print("\n--- POBIERANIE FUNDING RATE (BINANCE) ---")
+    funding_data = client.get_current_funding_rate("SOLUSDT")
+    print(f"[OK] Funding rate APR: {funding_data['annualized_rate'] * 100:.4f}%")
+
+
+==================================================
+PLIK: \src\data_feed\__init__.py
+==================================================
+
+
+==================================================
+PLIK: \src\notifications\telegram_bot.py
+==================================================
+
+
+==================================================
+PLIK: \src\notifications\__init__.py
+==================================================
+
+
+==================================================
+PLIK: \src\quant\black_scholes.py
+==================================================
+import os
+import sys
+import math
+from typing import Tuple, Dict, Any, Optional
+import numpy as np
+from scipy.stats import norm
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+
+class BlackScholesEngine:
+    """
+    Rygorystyczny silnik analityczny wyceny opcji i grek w modelu Blacka-Scholesa-Mertona (Black-76).
+    Zoptymalizowany pod realia krypto z dynamicznym kosztem carry (r - q), Å›cisÅ‚ymi zabezpieczeniami
+    brzegowymi oraz hybrydowym, odpornym numerycznie solverem zmiennoÅ›ci implikowanej (IV).
+    """
+
+    DAYS_PER_YEAR: float = 365.0  # Ujednolicony standard rynkowy krypto ACT/365
+    MIN_T: float = 1e-7          # Minimalny czas (< 3 sekundy), poniÅ¼ej ktÃ³rego przechodzimy na payoff terminalny
+    MIN_SIGMA: float = 1e-4      # Minimalna zmiennoÅ›Ä‡ (0.01%)
+    MAX_SIGMA: float = 5.0       # Maksymalna zmiennoÅ›Ä‡ (500% IV)
+
+    @classmethod
+    def calculate_d1_d2(
+        cls,
+        S: float,
+        K: float,
+        T: float,
+        r: float,
+        sigma: float,
+        q: float = 0.0
+    ) -> Tuple[float, float]:
+        """
+        Numerycznie bezpieczne wyliczanie standaryzowanych zmiennych d1 i d2.
+        ÅšciÅ›le zachowuje toÅ¼samoÅ›Ä‡ d2 = d1 - sigma * sqrt(T) bez asymetrycznego obcinania.
+        """
+        if T <= cls.MIN_T or sigma <= cls.MIN_SIGMA or S <= 0.0 or K <= 0.0:
+            return 0.0, 0.0
+
+        denominator = sigma * math.sqrt(T)
+        numerator = math.log(S / K) + (r - q + 0.5 * sigma ** 2) * T
+        d1 = numerator / denominator
+        d2 = d1 - denominator
+
+        return d1, d2
+
+    @classmethod
+    def price(
+        cls,
+        S: float,
+        K: float,
+        T: float,
+        r: float,
+        sigma: float,
+        q: float = 0.0,
+        option_type: str = "CALL"
+    ) -> float:
+        """
+        Analityczna wycena europejskiej opcji Call lub Put (Merton/Black-76).
+        """
+        opt_type = option_type.upper()
+        if opt_type not in ("CALL", "PUT"):
+            raise ValueError(f"Nieprawidlowy typ opcji: {option_type}. Oczekiwano CALL lub PUT.")
+
+        # 1. Zabezpieczenie brzegowe: Czas wygasÅ‚ (T -> 0)
+        if T <= cls.MIN_T:
+            if opt_type == "CALL":
+                return max(0.0, S - K)
+            else:
+                return max(0.0, K - S)
+
+        disc_r = math.exp(-r * T)
+        disc_q = math.exp(-q * T)
+
+        # 2. Zabezpieczenie brzegowe: ZmiennoÅ›Ä‡ zerowa (sigma -> 0)
+        # Wycena opiera siÄ™ na zdyskontowanej wartoÅ›ci wewnÄ™trznej na forwardzie
+        if sigma <= cls.MIN_SIGMA:
+            forward_diff = S * disc_q - K * disc_r
+            if opt_type == "CALL":
+                return max(0.0, forward_diff)
+            else:
+                return max(0.0, -forward_diff)
+
+        # 3. Standardowa wycena analityczna BSM
+        d1, d2 = cls.calculate_d1_d2(S, K, T, r, sigma, q)
+
+        if opt_type == "CALL":
+            val = S * disc_q * norm.cdf(d1) - K * disc_r * norm.cdf(d2)
+            return max(0.0, float(val))
+        else:
+            val = K * disc_r * norm.cdf(-d2) - S * disc_q * norm.cdf(-d1)
+            return max(0.0, float(val))
+
+    # =========================================================================
+    # GREKI PIERWSZEGO RZÄ˜DU
+    # =========================================================================
+
+    @classmethod
+    def delta(
+        cls,
+        S: float,
+        K: float,
+        T: float,
+        r: float,
+        sigma: float,
+        q: float = 0.0,
+        option_type: str = "CALL"
+    ) -> float:
+        opt_type = option_type.upper()
+        disc_q = math.exp(-q * T)
+
+        # Na granicy sigma -> 0 decyduje zdyskontowany forward vs strike
+        if T <= cls.MIN_T or sigma <= cls.MIN_SIGMA:
+            disc_r = math.exp(-r * T)
+            forward_diff = S * disc_q - K * disc_r
+            if opt_type == "CALL":
+                return disc_q if forward_diff > 0 else (0.5 * disc_q if forward_diff == 0 else 0.0)
+            else:
+                return -disc_q if forward_diff < 0 else (-0.5 * disc_q if forward_diff == 0 else 0.0)
+
+        d1, _ = cls.calculate_d1_d2(S, K, T, r, sigma, q)
+
+        if opt_type == "CALL":
+            return float(disc_q * norm.cdf(d1))
+        else:
+            return float(disc_q * (norm.cdf(d1) - 1.0))
+
+    @classmethod
+    def gamma(
+        cls,
+        S: float,
+        K: float,
+        T: float,
+        r: float,
+        sigma: float,
+        q: float = 0.0
+    ) -> float:
+        if T <= cls.MIN_T or sigma <= cls.MIN_SIGMA or S <= 0.0:
+            return 0.0
+
+        d1, _ = cls.calculate_d1_d2(S, K, T, r, sigma, q)
+        disc_q = math.exp(-q * T)
+        pdf_d1 = norm.pdf(d1)
+        denom = S * sigma * math.sqrt(T)
+
+        if denom < 1e-12:
+            return 0.0
+
+        return float((disc_q * pdf_d1) / denom)
+
+    @classmethod
+    def vega(
+        cls,
+        S: float,
+        K: float,
+        T: float,
+        r: float,
+        sigma: float,
+        q: float = 0.0
+    ) -> float:
+        """
+        Zwraca VegÄ™ rynkowÄ…: zmianÄ™ ceny opcji przy zmianie IV o 1 punkt procentowy (0.01).
+        """
+        if T <= cls.MIN_T or sigma <= cls.MIN_SIGMA or S <= 0.0:
+            return 0.0
+
+        d1, _ = cls.calculate_d1_d2(S, K, T, r, sigma, q)
+        disc_q = math.exp(-q * T)
+        raw_vega = S * disc_q * norm.pdf(d1) * math.sqrt(T)
+
+        return float(raw_vega / 100.0)
+
+    @classmethod
+    def theta(
+        cls,
+        S: float,
+        K: float,
+        T: float,
+        r: float,
+        sigma: float,
+        q: float = 0.0,
+        option_type: str = "CALL"
+    ) -> float:
+        """
+        Zwraca ThetÄ™ dobowÄ…: erozjÄ™ czasowÄ… opcji na 1 dzieÅ„ (1/365.0 roku).
+        """
+        if T <= cls.MIN_T:
+            return 0.0
+
+        opt_type = option_type.upper()
+        d1, d2 = cls.calculate_d1_d2(S, K, T, r, sigma, q)
+        disc_q = math.exp(-q * T)
+        disc_r = math.exp(-r * T)
+        pdf_d1 = norm.pdf(d1)
+
+        term1 = -(S * disc_q * pdf_d1 * sigma) / (2.0 * math.sqrt(T))
+
+        if opt_type == "CALL":
+            term2 = q * S * disc_q * norm.cdf(d1) - r * K * disc_r * norm.cdf(d2)
+        else:
+            term2 = -q * S * disc_q * norm.cdf(-d1) + r * K * disc_r * norm.cdf(-d2)
+
+        theta_annual = term1 + term2
+        return float(theta_annual / cls.DAYS_PER_YEAR)
+
+    @classmethod
+    def rho(
+        cls,
+        S: float,
+        K: float,
+        T: float,
+        r: float,
+        sigma: float,
+        q: float = 0.0,
+        option_type: str = "CALL"
+    ) -> float:
+        """
+        Zwraca Rho na 1 punkt procentowy zmiany stopy wolnej od ryzyka (0.01).
+        """
+        if T <= cls.MIN_T:
+            return 0.0
+
+        opt_type = option_type.upper()
+        _, d2 = cls.calculate_d1_d2(S, K, T, r, sigma, q)
+        disc_r = math.exp(-r * T)
+
+        if opt_type == "CALL":
+            raw_rho = K * T * disc_r * norm.cdf(d2)
+        else:
+            raw_rho = -K * T * disc_r * norm.cdf(-d2)
+
+        return float(raw_rho / 100.0)
+
+    # =========================================================================
+    # GREKI DRUGIEGO RZÄ˜DU
+    # =========================================================================
+
+    @classmethod
+    def vanna(
+        cls,
+        S: float,
+        K: float,
+        T: float,
+        r: float,
+        sigma: float,
+        q: float = 0.0
+    ) -> float:
+        """
+        Vanna: dDelta / dSigma = dVega / dS.
+        Zwraca zmianÄ™ Delty przy wzroÅ›cie IV o 1 punkt procentowy (0.01).
+        """
+        if T <= cls.MIN_T or sigma <= cls.MIN_SIGMA or S <= 0.0:
+            return 0.0
+
+        d1, d2 = cls.calculate_d1_d2(S, K, T, r, sigma, q)
+        disc_q = math.exp(-q * T)
+        raw_vanna = -disc_q * norm.pdf(d1) * (d2 / sigma)
+
+        return float(raw_vanna / 100.0)
+
+    @classmethod
+    def volga(
+        cls,
+        S: float,
+        K: float,
+        T: float,
+        r: float,
+        sigma: float,
+        q: float = 0.0
+    ) -> float:
+        """
+        Volga (Vomma): d^2V / dSigma^2. WypukÅ‚oÅ›Ä‡ zmiennoÅ›ci.
+        Zwraca zmianÄ™ Vegi przy wzroÅ›cie IV o 1 punkt procentowy (0.01).
+        """
+        if T <= cls.MIN_T or sigma <= cls.MIN_SIGMA or S <= 0.0:
+            return 0.0
+
+        d1, d2 = cls.calculate_d1_d2(S, K, T, r, sigma, q)
+        disc_q = math.exp(-q * T)
+        raw_vega = S * disc_q * norm.pdf(d1) * math.sqrt(T)
+        raw_volga = raw_vega * (d1 * d2 / sigma)
+
+        return float(raw_volga / 10000.0)
+
+    @classmethod
+    def get_all_greeks(
+        cls,
+        S: float,
+        K: float,
+        T: float,
+        r: float,
+        sigma: float,
+        q: float = 0.0,
+        option_type: str = "CALL"
+    ) -> Dict[str, float]:
+        """
+        Zwraca peÅ‚en pakiet grek i wyceny w jednym sÅ‚owniku.
+        """
+        p = cls.price(S, K, T, r, sigma, q, option_type)
+        d = cls.delta(S, K, T, r, sigma, q, option_type)
+        g = cls.gamma(S, K, T, r, sigma, q)
+        v = cls.vega(S, K, T, r, sigma, q)
+        t = cls.theta(S, K, T, r, sigma, q, option_type)
+        rh = cls.rho(S, K, T, r, sigma, q, option_type)
+        vn = cls.vanna(S, K, T, r, sigma, q)
+        vg = cls.volga(S, K, T, r, sigma, q)
+
+        return {
+            "price": round(p, 4),
+            "delta": round(d, 4),
+            "gamma": round(g, 6),
+            "theta_daily": round(t, 4),
+            "vega_1pct": round(v, 4),
+            "rho_1pct": round(rh, 4),
+            "vanna_1pct": round(vn, 6),
+            "volga_1pct": round(vg, 6)
+        }
+
+    # =========================================================================
+    # HYBRYDOWY SOLVER IV
+    # =========================================================================
+
+    @classmethod
+    def implied_volatility(
+        cls,
+        market_price: float,
+        S: float,
+        K: float,
+        T: float,
+        r: float = 0.05,
+        q: float = 0.0,
+        option_type: str = "CALL",
+        tolerance: float = 1e-6,
+        max_iterations: int = 30
+    ) -> float:
+        """
+        Odporny numerycznie hybrydowy solver zmiennoÅ›ci implikowanej.
+        Zwraca float('nan') w przypadku naruszenia warunkÃ³w braku arbitraÅ¼u (zamiast sztucznego
+        faÅ‚szowania danych jako 0.0001 lub MAX_SIGMA).
+        """
+        if market_price <= 0.0 or T <= cls.MIN_T or S <= 0.0 or K <= 0.0:
+            return float("nan")
+
+        opt_type = option_type.upper()
+        disc_r = math.exp(-r * T)
+        disc_q = math.exp(-q * T)
+
+        # 1. Granice braku arbitraÅ¼u dla opcji europejskiej z carry
+        if opt_type == "CALL":
+            intrinsic = max(0.0, S * disc_q - K * disc_r)
+            max_price = S * disc_q
+        else:
+            intrinsic = max(0.0, K * disc_r - S * disc_q)
+            max_price = K * disc_r
+
+        # Odrzucenie cen naruszajÄ…cych no-arbitrage bounds
+        if market_price < intrinsic - 1e-7 or market_price > max_price + 1e-7:
+            return float("nan")
+
+        if abs(market_price - intrinsic) < 1e-7:
+            return cls.MIN_SIGMA
+
+        # 2. Punkt startowy dopasowany do forwardu
+        forward = S * math.exp((r - q) * T)
+        moneyness = forward / K
+        if 0.8 <= moneyness <= 1.2:
+            sigma0 = math.sqrt(2.0 * math.pi / T) * (market_price / (S * disc_q))
+        else:
+            sigma0 = 0.60  # DomyÅ›lny stabilny punkt startowy dla krypto
+
+        sigma = max(cls.MIN_SIGMA, min(cls.MAX_SIGMA, sigma0))
+
+        # 3. Newton-Raphson
+        use_bisection = False
+        for _ in range(max_iterations):
+            p_est = cls.price(S, K, T, r, sigma, q, opt_type)
+            diff = p_est - market_price
+
+            if abs(diff) < tolerance:
+                return round(float(sigma), 4)
+
+            d1, _ = cls.calculate_d1_d2(S, K, T, r, sigma, q)
+            raw_vega = S * disc_q * norm.pdf(d1) * math.sqrt(T)
+
+            if raw_vega < 1e-8:
+                use_bisection = True
+                break
+
+            step = diff / raw_vega
+            sigma -= step
+
+            if sigma <= cls.MIN_SIGMA or sigma >= cls.MAX_SIGMA:
+                use_bisection = True
+                break
+
+        # 4. Bisekcja awaryjna
+        if use_bisection:
+            low = cls.MIN_SIGMA
+            high = cls.MAX_SIGMA
+
+            for _ in range(45):
+                mid = (low + high) / 2.0
+                p_mid = cls.price(S, K, T, r, mid, q, opt_type)
+                diff = p_mid - market_price
+
+                if abs(diff) < tolerance:
+                    return round(float(mid), 4)
+
+                if diff > 0:
+                    high = mid
+                else:
+                    low = mid
+
+            sigma = (low + high) / 2.0
+
+        return round(float(sigma), 4)
+
+
+if __name__ == "__main__":
+    from src.data_feed.market_spot import MarketSpotClient
+    from src.data_feed.derive_client import DeriveClient
+
+    print("==================================================")
+    print("TEST MODELU BLACKA-SCHOLESA NA Å»YWYM RYNKU W RAM")
+    print("==================================================")
+
+    # 1. Dynamiczne pobranie parametrÃ³w rynkowych
+    spot_client = MarketSpotClient()
+    derive_client = DeriveClient()
+
+    live_spot = derive_client.get_spot_price("SOL")
+    funding_info = spot_client.get_current_funding_rate("SOLUSDT")
+    q_funding = funding_info.get("annualized_rate", 0.0)
+    r_macro = spot_client.get_us_treasury_risk_free_rate()
+
+    # 2. Pobranie Å¼ywego Å‚aÅ„cucha opcji z Derive
+    df_options = derive_client.get_clean_options_chain("SOL", min_dte=5.0, max_dte=35.0)
+    if df_options.empty:
+        print("[BÅÄ„D] Brak danych opcyjnych w RAM.")
+        sys.exit(1)
+
+    first_exp = df_options["expiry_str"].iloc[0]
+    exp_df = df_options[df_options["expiry_str"] == first_exp]
+
+    live_t = float(exp_df["T"].iloc[0])
+    live_dte = float(exp_df["dte"].iloc[0])
+
+    # 3. Dynamiczne znalezienie Å¼ywej opcji Call i Put ATM
+    calls = exp_df[exp_df["option_type"] == "CALL"].sort_values(by="strike")
+    atm_idx = (calls["strike"] - live_spot).abs().idxmin()
+    live_atm_call = calls.loc[atm_idx]
+
+    live_k = float(live_atm_call["strike"])
+    live_iv = float(live_atm_call["iv"]) if live_atm_call["iv"] is not None else 0.60
+    derive_call_mark = float(live_atm_call["mark"])
+
+    puts = exp_df[(exp_df["option_type"] == "PUT") & (exp_df["strike"] == live_k)]
+    derive_put_mark = float(puts.iloc[0]["mark"]) if not puts.empty else 0.0
+
+    print(f"\n1. Parametry rynkowe pobrane dynamicznie do RAM:")
+    print(f"  - Kurs referencyjny SOL (Spot):       {live_spot} USD")
+    print(f"  - Dynamiczna stopa r (U.S. Treasury): {r_macro * 100:.2f}%")
+    print(f"  - Funding Rate perps (APR q):          {q_funding * 100:.4f}%")
+    print(f"  - Seria wygasania:                     {first_exp} (DTE: {live_dte} dni, T: {live_t:.6f})")
+    print(f"  - Strike ATM:                          {live_k} USD")
+    print(f"  - Å»ywe IV z Derive:                    {live_iv * 100:.2f}%")
+
+    bs = BlackScholesEngine()
+
+    # 4. Wycena analityczna vs Ceny Mark z Derive
+    model_c_price = bs.price(live_spot, live_k, live_t, r_macro, live_iv, q_funding, "CALL")
+    model_p_price = bs.price(live_spot, live_k, live_t, r_macro, live_iv, q_funding, "PUT")
+
+    print(f"\n2. Weryfikacja wyceny analitycznej vs GieÅ‚da Derive:")
+    print(f"  - Call ($ {live_k}) Wycena Modelu:     {model_c_price:.4f} USD | Derive Mark: {derive_call_mark:.4f} USD")
+    print(f"  - Put  ($ {live_k}) Wycena Modelu:     {model_p_price:.4f} USD | Derive Mark: {derive_put_mark:.4f} USD")
+
+    # 5. Parytet Call-Put na Å¼ywych danych rynkowych
+    left_parity = model_c_price - model_p_price
+    right_parity = live_spot * math.exp(-q_funding * live_t) - live_k * math.exp(-r_macro * live_t)
+    parity_err = abs(left_parity - right_parity)
+    print(f"  - BÅ‚Ä…d parytetu Call-Put:              {parity_err:.10f}")
+    assert parity_err < 1e-5, "[BÅÄ„D] Naruszenie parytetu Call-Put!"
+    print("  [OK] Parytet Call-Put jest speÅ‚niony z dokÅ‚adnoÅ›ciÄ… maszynowÄ….")
+
+    # 6. PeÅ‚ny pakiet analitycznych grek dla Å¼ywego kontraktu ATM
+    print(f"\n3. Analityczne greki dla Å¼ywego kontraktu ATM Call ({live_k} USD):")
+    live_greeks = bs.get_all_greeks(live_spot, live_k, live_t, r_macro, live_iv, q_funding, "CALL")
+    for k, v in live_greeks.items():
+        print(f"  - {k:<15}: {v}")
+
+    # 7. Test odpornoÅ›ci solvera IV na Å¼ywym rynku
+    recovered_iv = bs.implied_volatility(
+        market_price=model_c_price,
+        S=live_spot,
+        K=live_k,
+        T=live_t,
+        r=r_macro,
+        q=q_funding,
+        option_type="CALL"
+    )
+    print(f"\n4. Test solvera IV na Å¼ywym rynku:")
+    print(f"  - Oczekiwane IV:                       {live_iv * 100:.2f}%")
+    print(f"  - Odzyskane IV:                        {recovered_iv * 100:.2f}%")
+    print(f"  - BÅ‚Ä…d odzyskania:                     {abs(recovered_iv - live_iv):.6f}")
+
+    # 8. Testy odpornoÅ›ci skrajnej (Zero krachÃ³w numerycznych)
+    print(f"\n5. Testy odpornoÅ›ci skrajnej (Boundary Edge-Cases):")
+    p_t_zero = bs.price(live_spot, live_k, 0.0, r_macro, live_iv, q_funding, "CALL")
+    print(f"  - Payoff przy T=0 (WygaÅ›niÄ™cie):       {p_t_zero:.2f} USD")
+
+    iv_arbitrage = bs.implied_volatility(0.01, live_spot, 400.0, live_t, r_macro, q_funding, "CALL")
+    print(f"  - Solver dla Deep OTM (K=400):         {iv_arbitrage}")
+
+    print("\n[SUKCES] Silnik BlackScholesEngine dziaÅ‚a stabilnie i precyzyjnie.")
+
+
+==================================================
+PLIK: \src\quant\greeks.py
+==================================================
+import os
+import sys
+import math
+from typing import Dict, Any, List, Optional, Union
+import pandas as pd
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from src.quant.black_scholes import BlackScholesEngine
+
+
+class PortfolioGreeksEngine:
+    """
+    Zaawansowany agregator grek portfelowych i wielonogowych struktur opcyjnych (Spready,
+    Kalendarze, Diagonale, Kondory, Strangle). Zapewnia peÅ‚nÄ… spÃ³jnoÅ›Ä‡ wymiarowÄ… jednostek,
+    obsÅ‚uguje niezaleÅ¼ne terminy wygaÅ›niÄ™cia dla poszczegÃ³lnych nÃ³g oraz realizuje
+    rygorystycznÄ… dekompozycjÄ™ PnL drugiego rzÄ™du (Taylor: Delta-Gamma-Theta-Vega-Vanna-Volga).
+    """
+
+    DAYS_PER_YEAR: float = 365.0  # Standard krypto ACT/365 (spÃ³jny z Deribit i Derive)
+
+    @classmethod
+    def parse_leg_weight(cls, side: Union[str, int, float], amount: float = 1.0) -> float:
+        """
+        Zwraca znakowanÄ… wagÄ™ pozycji w strukturze:
+        +amount dla pozycji dÅ‚ugiej (BUY / LONG),
+        -amount dla pozycji krÃ³tkiej (SELL / SHORT).
+        """
+        if isinstance(side, (int, float)):
+            sign = 1.0 if side >= 0 else -1.0
+        elif isinstance(side, str):
+            sign = 1.0 if side.upper() in ("BUY", "LONG", "+", "+1") else -1.0
+        else:
+            sign = 1.0
+        return float(sign * abs(amount))
+
+    @classmethod
+    def resolve_leg_t(cls, leg: Dict[str, Any], global_t: Optional[float] = None) -> float:
+        """
+        Pomocnicza funkcja rozwiÄ…zujÄ…ca czas do wygaÅ›niÄ™cia T dla pojedynczej nogi.
+        Priorytet: leg['T'] -> leg['dte'] -> global_t.
+        """
+        if "T" in leg and leg["T"] is not None:
+            return max(0.0, float(leg["T"]))
+        if "dte" in leg and leg["dte"] is not None:
+            return max(0.0, float(leg["dte"]) / cls.DAYS_PER_YEAR)
+        if global_t is not None:
+            return max(0.0, float(global_t))
+        raise ValueError(f"Nie podano horyzontu czasowego (T lub dte) dla nogi: {leg}")
+
+    @classmethod
+    def aggregate_spread_greeks(
+        cls,
+        legs: List[Dict[str, Any]],
+        S: float,
+        T: Optional[float] = None,
+        r: float = 0.05,
+        q: float = 0.0
+    ) -> Dict[str, Any]:
+        """
+        Agreguje greki portfela opcyjnego. ObsÅ‚uguje zarÃ³wno struktury o wspÃ³lnym terminie
+        wygaÅ›niÄ™cia (vertical spreads), jak i rÃ³Å¼ne terminy wygaÅ›niÄ™cia poszczegÃ³lnych nÃ³g
+        (calendar / diagonal spreads).
+        """
+        if not legs or S <= 0.0:
+            return {
+                "net_price": 0.0,
+                "net_delta": 0.0,
+                "net_gamma": 0.0,
+                "net_theta_daily": 0.0,
+                "net_vega_1pct": 0.0,
+                "net_rho_1pct": 0.0,
+                "net_vanna_1pct": 0.0,
+                "net_volga_1pct": 0.0,
+                "legs_breakdown": []
+            }
+
+        total_net_price = 0.0
+        total_net_delta = 0.0
+        total_net_gamma = 0.0
+        total_net_theta = 0.0
+        total_net_vega = 0.0
+        total_net_rho = 0.0
+        total_net_vanna = 0.0
+        total_net_volga = 0.0
+
+        legs_detail = []
+
+        for leg in legs:
+            K = float(leg.get("strike", S))
+            opt_type = str(leg.get("option_type", "CALL")).upper()
+            iv = float(leg.get("iv", 0.60))
+            amount = float(leg.get("amount", 1.0))
+            side = leg.get("side", "BUY")
+
+            leg_t = cls.resolve_leg_t(leg, T)
+            weight = cls.parse_leg_weight(side, amount)
+
+            # Analityczne greki pojedynczego kontraktu z silnika BlackScholesEngine
+            g = BlackScholesEngine.get_all_greeks(S=S, K=K, T=leg_t, r=r, sigma=iv, q=q, option_type=opt_type)
+
+            leg_price_weighted = g["price"] * weight
+            leg_delta_weighted = g["delta"] * weight
+            leg_gamma_weighted = g["gamma"] * weight
+            leg_theta_weighted = g["theta_daily"] * weight
+            leg_vega_weighted = g["vega_1pct"] * weight
+            leg_rho_weighted = g["rho_1pct"] * weight
+            leg_vanna_weighted = g["vanna_1pct"] * weight
+            leg_volga_weighted = g["volga_1pct"] * weight
+
+            total_net_price += leg_price_weighted
+            total_net_delta += leg_delta_weighted
+            total_net_gamma += leg_gamma_weighted
+            total_net_theta += leg_theta_weighted
+            total_net_vega += leg_vega_weighted
+            total_net_rho += leg_rho_weighted
+            total_net_vanna += leg_vanna_weighted
+            total_net_volga += leg_volga_weighted
+
+            legs_detail.append({
+                "strike": K,
+                "option_type": opt_type,
+                "side": "BUY" if weight > 0 else "SELL",
+                "amount": abs(amount),
+                "iv": iv,
+                "T": leg_t,
+                "dte": round(leg_t * cls.DAYS_PER_YEAR, 2),
+                "single_price": g["price"],
+                "weighted_price": round(leg_price_weighted, 4),
+                "single_delta": g["delta"],
+                "weighted_delta": round(leg_delta_weighted, 4),
+                "single_gamma": g["gamma"],
+                "weighted_gamma": round(leg_gamma_weighted, 6),
+                "single_theta": g["theta_daily"],
+                "weighted_theta": round(leg_theta_weighted, 4),
+                "single_vega": g["vega_1pct"],
+                "weighted_vega": round(leg_vega_weighted, 4),
+                "single_vanna": g["vanna_1pct"],
+                "weighted_vanna": round(leg_vanna_weighted, 6),
+                "single_volga": g["volga_1pct"],
+                "weighted_volga": round(leg_volga_weighted, 6)
+            })
+
+        return {
+            "net_price": round(total_net_price, 4),
+            "net_delta": round(total_net_delta, 4),
+            "net_gamma": round(total_net_gamma, 6),
+            "net_theta_daily": round(total_net_theta, 4),
+            "net_vega_1pct": round(total_net_vega, 4),
+            "net_rho_1pct": round(total_net_rho, 4),
+            "net_vanna_1pct": round(total_net_vanna, 6),
+            "net_volga_1pct": round(total_net_volga, 6),
+            "legs_breakdown": legs_detail
+        }
+
+    @classmethod
+    def scenario_stress_test(
+        cls,
+        legs: List[Dict[str, Any]],
+        S: float,
+        T: Optional[float] = None,
+        r: float = 0.05,
+        q: float = 0.0,
+        price_shift_pct: float = 0.0,
+        iv_shift_pts: float = 0.0,
+        days_forward: float = 0.0
+    ) -> Dict[str, Any]:
+        """
+        Nieliniowa symulacja warunkÃ³w skrajnych (What-If Analysis).
+        Przelicza portfel przy wstrzÄ…sie cenowym spot, szoku zmiennoÅ›ci IV oraz upÅ‚ywie czasu.
+        Zapewnia peÅ‚nÄ… spÃ³jnoÅ›Ä‡ wymiarowÄ… aproksymacji Taylora drugiego rzÄ™du
+        (Delta, Gamma, Vega, Theta, Vanna, Volga) z rzeczywistym repricingiem.
+        """
+        base_state = cls.aggregate_spread_greeks(legs=legs, S=S, T=T, r=r, q=q)
+        base_value = base_state["net_price"]
+
+        # 1. Wektor szokÃ³w rynkowych
+        new_spot = S * (1.0 + price_shift_pct)
+        delta_s = new_spot - S
+        delta_sigma = iv_shift_pts  # Zmiana uÅ‚amkowa IV (np. +0.05 to +5 p.p. IV)
+
+        # 2. PeÅ‚ny repricing numeryczny (Full Non-Linear Repricing) z niezaleÅ¼nym czasem dla kaÅ¼dej nogi
+        new_legs = []
+        theta_taylor_pnl = 0.0
+
+        for leg_info in base_state["legs_breakdown"]:
+            leg_t_base = leg_info["T"]
+            leg_max_days = leg_t_base * cls.DAYS_PER_YEAR
+
+            # BezwzglÄ™dne zabezpieczenie przed erozjÄ… czasowÄ… po wygaÅ›niÄ™ciu
+            effective_leg_days = min(days_forward, leg_max_days)
+            time_decrement = effective_leg_days / cls.DAYS_PER_YEAR
+            new_leg_t = max(0.0, leg_t_base - time_decrement)
+
+            # Erozja czasowa w Taylorze per noga (ograniczona do terminu wygaÅ›niÄ™cia)
+            theta_taylor_pnl += leg_info["weighted_theta"] * effective_leg_days
+
+            new_leg = {
+                "strike": leg_info["strike"],
+                "option_type": leg_info["option_type"],
+                "side": leg_info["side"],
+                "amount": leg_info["amount"],
+                "T": new_leg_t,
+                "iv": max(BlackScholesEngine.MIN_SIGMA, min(BlackScholesEngine.MAX_SIGMA, leg_info["iv"] + iv_shift_pts))
+            }
+            new_legs.append(new_leg)
+
+        shocked_state = cls.aggregate_spread_greeks(legs=new_legs, S=new_spot, T=None, r=r, q=q)
+        new_value = shocked_state["net_price"]
+        exact_pnl = new_value - base_value
+
+        # 3. SpÃ³jna wymiarowo aproksymacja Taylora drugiego rzÄ™du
+        # Przywracamy surowe pochodne czÄ…stkowe z wartoÅ›ci znormalizowanych do 1 p.p.
+        raw_vega = base_state["net_vega_1pct"] * 100.0       # dV / dSigma
+        raw_vanna = base_state["net_vanna_1pct"] * 100.0     # d^2V / (dS dSigma)
+        raw_volga = base_state["net_volga_1pct"] * 10000.0   # d^2V / dSigma^2
+
+        delta_pnl = base_state["net_delta"] * delta_s
+        gamma_pnl = 0.5 * base_state["net_gamma"] * (delta_s ** 2.0)
+        theta_pnl = theta_taylor_pnl
+        vega_pnl = raw_vega * delta_sigma
+        vanna_pnl = raw_vanna * delta_s * delta_sigma
+        volga_pnl = 0.5 * raw_volga * (delta_sigma ** 2.0)
+
+        taylor_pnl = delta_pnl + gamma_pnl + theta_pnl + vega_pnl + vanna_pnl + volga_pnl
+        taylor_error = exact_pnl - taylor_pnl
+
+        # Åšrednie resztkowe DTE caÅ‚ego portfela
+        remaining_dtes = [l["dte"] for l in shocked_state["legs_breakdown"]]
+        avg_remaining_dte = (sum(remaining_dtes) / len(remaining_dtes)) if remaining_dtes else 0.0
+
+        return {
+            "base_spot": round(S, 2),
+            "shocked_spot": round(new_spot, 2),
+            "spot_change_usd": round(delta_s, 2),
+            "spot_change_pct": round(price_shift_pct * 100.0, 2),
+            "iv_shift_pts": round(iv_shift_pts * 100.0, 2),
+            "days_elapsed": round(days_forward, 2),
+            "avg_remaining_dte": round(avg_remaining_dte, 2),
+            "base_portfolio_value": round(base_value, 4),
+            "new_portfolio_value": round(new_value, 4),
+            "exact_pnl_usd": round(exact_pnl, 4),
+            "taylor_pnl_approx": round(taylor_pnl, 4),
+            "decomposition": {
+                "delta_pnl": round(delta_pnl, 4),
+                "gamma_pnl": round(gamma_pnl, 4),
+                "theta_pnl": round(theta_pnl, 4),
+                "vega_pnl": round(vega_pnl, 4),
+                "vanna_pnl": round(vanna_pnl, 4),
+                "volga_pnl": round(volga_pnl, 4)
+            },
+            "non_linear_residual": round(taylor_error, 4),
+            "new_net_delta": shocked_state["net_delta"],
+            "new_net_gamma": shocked_state["net_gamma"],
+            "new_net_theta_daily": shocked_state["net_theta_daily"],
+            "new_net_vega_1pct": shocked_state["net_vega_1pct"]
+        }
+
+    @classmethod
+    def calculate_delta_hedge(
+        cls,
+        net_delta: float,
+        min_hedge_threshold: float = 0.01
+    ) -> Dict[str, Any]:
+        """
+        Zwraca parametry zlecenia zabezpieczajÄ…cego ekspozycjÄ™ kierunkowÄ… portfela.
+        UwzglÄ™dnia pasmo martwe (deadband), eliminujÄ…c mikrozlecenia poniÅ¼ej minimalnego kroku gieÅ‚dy.
+        """
+        if abs(net_delta) < min_hedge_threshold:
+            return {
+                "net_delta_to_neutralize": round(net_delta, 4),
+                "hedge_action": "BALANCED",
+                "hedge_amount": 0.0
+            }
+
+        hedge_units = -net_delta
+        action = "BUY_SPOT_PERP" if hedge_units > 0 else "SELL_SPOT_PERP"
+
+        return {
+            "net_delta_to_neutralize": round(net_delta, 4),
+            "hedge_action": action,
+            "hedge_amount": round(abs(hedge_units), 4)
+        }
+
+
+if __name__ == "__main__":
+    from src.data_feed.market_spot import MarketSpotClient
+    from src.data_feed.derive_client import DeriveClient
+
+    print("==================================================")
+    print("TEST ZMODERNIZOWANEGO PORTFOLIOGREEKSENGINE W RAM")
+    print("==================================================")
+
+    spot_client = MarketSpotClient()
+    derive_client = DeriveClient()
+
+    live_spot = derive_client.get_spot_price("SOL") or 150.0
+    funding_info = spot_client.get_current_funding_rate("SOLUSDT")
+    q_funding = funding_info.get("annualized_rate", 0.0)
+    r_macro = spot_client.get_us_treasury_risk_free_rate()
+
+    print(f"Kurs Spot: {live_spot} USD | Stopa r: {r_macro * 100:.2f}% | Funding q: {q_funding * 100:.4f}%\n")
+
+    # PrzykÅ‚adowy Bull Call Spread (Vertical)
+    spread = [
+        {"strike": live_spot, "option_type": "CALL", "side": "BUY", "amount": 10.0, "iv": 0.60, "dte": 14.0},
+        {"strike": live_spot * 1.10, "option_type": "CALL", "side": "SELL", "amount": 10.0, "iv": 0.65, "dte": 14.0}
+    ]
+
+    base_metrics = PortfolioGreeksEngine.aggregate_spread_greeks(spread, S=live_spot, r=r_macro, q=q_funding)
+    print(f"Wycena poczÄ…tkowa: {base_metrics['net_price']:.2f} USD")
+    print(f"Delta netto:       {base_metrics['net_delta']:.4f} SOL")
+    print(f"Gamma netto:       {base_metrics['net_gamma']:.6f}")
+    print(f"Theta dobowa:      {base_metrics['net_theta_daily']:.4f} USD/dzieÅ„")
+    print(f"Vega netto 1%:     {base_metrics['net_vega_1pct']:.4f} USD\n")
+
+    stress_res = PortfolioGreeksEngine.scenario_stress_test(
+        legs=spread,
+        S=live_spot,
+        r=r_macro,
+        q=q_funding,
+        price_shift_pct=+0.05,
+        iv_shift_pts=-0.03,
+        days_forward=3.0
+    )
+
+    print("--- WYNIK STRESS TESTU (+5% Spot, -3% IV, +3 dni) ---")
+    print(f"Rzeczywisty PnL (Repricing): {stress_res['exact_pnl_usd']:+.4f} USD")
+    print(f"Aproksymacja Taylora:        {stress_res['taylor_pnl_approx']:+.4f} USD")
+    print(f"Residuum nieliniowe:         {stress_res['non_linear_residual']:+.4f} USD")
+    print("Dekompozycja skÅ‚adowych PnL:", stress_res["decomposition"])
+
+    hedge_info = PortfolioGreeksEngine.calculate_delta_hedge(base_metrics["net_delta"], min_hedge_threshold=0.05)
+    print(f"\nDelta Hedge: {hedge_info['hedge_action']} {hedge_info['hedge_amount']} SOL")
+
+
+==================================================
+PLIK: \src\quant\payoff.py
+==================================================
+import os
+import sys
+import math
+from typing import Dict, Any, List, Optional, Tuple, Union
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from src.quant.black_scholes import BlackScholesEngine
+from src.quant.greeks import PortfolioGreeksEngine
+
+
+class PayoffEngine:
+    """
+    Rygorystyczny silnik analityczny profilu wypÅ‚aty, kalkulacji punktÃ³w przeÅ‚amania (Breakeven),
+    metryk asymetrii ryzyka do zysku (Risk/Reward), prawdopodobieÅ„stwa zysku (PoP) oraz
+    wartoÅ›ci oczekiwanej (EV) dla jedno- i wielonogowych struktur opcyjnych na gieÅ‚dach Derive i Deribit.
+    W peÅ‚ni zachowuje strukturÄ™ uÅ›miechu zmiennoÅ›ci (Volatility Skew) dla kaÅ¼dej nogi portfela.
+    """
+
+    DAYS_PER_YEAR: float = 365.0
+
+    # DomyÅ›lne parametry prowizji gieÅ‚dowych (stan na 2026 r.)
+    # Derive: ~15 bps od wartoÅ›ci bazowej, z limitem max 25% wartoÅ›ci premii
+    DERIVE_TAKER_FEE_BPS: float = 0.0015
+    DERIVE_FEE_CAP_PCT: float = 0.25
+
+    # Deribit: ~3 bps od wartoÅ›ci bazowej, z limitem max 12.5% wartoÅ›ci premii
+    DERIBIT_TAKER_FEE_BPS: float = 0.0003
+    DERIBIT_FEE_CAP_PCT: float = 0.125
+
+    @classmethod
+    def calculate_leg_fee(
+        cls,
+        spot: float,
+        premium: float,
+        amount: float = 1.0,
+        exchange: str = "derive",
+        fee_bps: Optional[float] = None,
+        fee_cap_pct: Optional[float] = None
+    ) -> float:
+        """
+        Oblicza prowizjÄ™ transakcyjnÄ… z uwzglÄ™dnieniem limitu procentowego (fee cap).
+        Gwarantuje brak aberracji: dla premium <= 0 prowizja wynosi bezwzglÄ™dnie 0.0 USD.
+        """
+        ex = exchange.lower()
+        if fee_bps is not None and fee_cap_pct is not None:
+            bps = fee_bps
+            cap = fee_cap_pct
+        elif ex == "derive":
+            bps = cls.DERIVE_TAKER_FEE_BPS
+            cap = cls.DERIVE_FEE_CAP_PCT
+        else:
+            bps = cls.DERIBIT_TAKER_FEE_BPS
+            cap = cls.DERIBIT_FEE_CAP_PCT
+
+        raw_fee = spot * bps
+        max_fee = max(0.0, premium * cap)
+        unit_fee = min(raw_fee, max_fee)
+
+        return float(unit_fee * abs(amount))
+
+    @classmethod
+    def evaluate_terminal_payoff(
+        cls,
+        legs: List[Dict[str, Any]],
+        S_T: Union[float, np.ndarray],
+        net_cost: float = 0.0
+    ) -> Union[float, np.ndarray]:
+        """
+        Oblicza czysty PnL terminalny w momencie wygaÅ›niÄ™cia (T = 0) dla podanego kursu lub wektora kursÃ³w S_T.
+        PnL = WypÅ‚ata_brutto - Koszt_netto
+        """
+        is_array = isinstance(S_T, np.ndarray)
+        payoff = np.zeros_like(S_T, dtype=float) if is_array else 0.0
+
+        for leg in legs:
+            K = float(leg.get("strike", 0.0))
+            opt_type = str(leg.get("option_type", "CALL")).upper()
+            side = leg.get("side", "BUY")
+            amount = float(leg.get("amount", 1.0))
+            weight = PortfolioGreeksEngine.parse_leg_weight(side, amount)
+
+            if opt_type == "CALL":
+                if is_array:
+                    leg_payout = np.maximum(0.0, S_T - K)
+                else:
+                    leg_payout = max(0.0, S_T - K)
+            elif opt_type == "PUT":
+                if is_array:
+                    leg_payout = np.maximum(0.0, K - S_T)
+                else:
+                    leg_payout = max(0.0, K - S_T)
+            else:
+                continue
+
+            payoff = payoff + (weight * leg_payout)
+
+        return payoff - net_cost
+
+    @classmethod
+    def _find_exact_breakevens(
+        cls,
+        legs: List[Dict[str, Any]],
+        net_cost: float
+    ) -> List[float]:
+        """
+        Analityczne wyznaczenie wszystkich punktÃ³w przeÅ‚amania (miejsc zerowych PnL).
+        DziaÅ‚a bez heurystyk numerycznych: bada odcinki wewnÄ™trzne [0, K_1], ..., [K_{n-1}, K_n]
+        oraz wyznacza pierwiastek analityczny na prawej pÃ³Å‚prostej [K_n, infinity).
+        """
+        strikes = sorted(list({float(leg["strike"]) for leg in legs if "strike" in leg}))
+        if not strikes:
+            return []
+
+        breakevens = []
+
+        # 1. Punkty wÄ™zÅ‚owe dla odcinkÃ³w wewnÄ™trznych
+        nodes = [0.0] + strikes
+        for i in range(len(nodes) - 1):
+            s_left = nodes[i]
+            s_right = nodes[i + 1]
+
+            pnl_left = float(cls.evaluate_terminal_payoff(legs, s_left, net_cost))
+            pnl_right = float(cls.evaluate_terminal_payoff(legs, s_right, net_cost))
+
+            if abs(pnl_left) < 1e-9:
+                breakevens.append(round(s_left, 4))
+            elif (pnl_left > 0.0 and pnl_right < 0.0) or (pnl_left < 0.0 and pnl_right > 0.0):
+                slope = (pnl_right - pnl_left) / (s_right - s_left)
+                if abs(slope) > 1e-12:
+                    root = s_left - (pnl_left / slope)
+                    if s_left <= root <= s_right:
+                        breakevens.append(round(root, 4))
+
+        # WÄ™zeÅ‚ koÅ„cowy K_max
+        max_k = strikes[-1]
+        pnl_max_k = float(cls.evaluate_terminal_payoff(legs, max_k, net_cost))
+        if abs(pnl_max_k) < 1e-9:
+            breakevens.append(round(max_k, 4))
+
+        # 2. Prawa pÃ³Å‚prosta [K_max, infinity): analityczne nachylenie
+        slope_inf = 0.0
+        for leg in legs:
+            opt_type = str(leg.get("option_type", "CALL")).upper()
+            if opt_type == "CALL":
+                w = PortfolioGreeksEngine.parse_leg_weight(leg.get("side", "BUY"), leg.get("amount", 1.0))
+                slope_inf += w * 1.0
+
+        if abs(slope_inf) > 1e-12:
+            root_inf = max_k - (pnl_max_k / slope_inf)
+            if root_inf > max_k + 1e-7:
+                breakevens.append(round(float(root_inf), 4))
+
+        # Oczyszczenie i dedublikacja
+        unique_breakevens = []
+        for b in sorted(breakevens):
+            if not unique_breakevens or not math.isclose(unique_breakevens[-1], b, abs_tol=1e-4):
+                unique_breakevens.append(b)
+
+        return unique_breakevens
+
+    @classmethod
+    def calculate_pop(
+        cls,
+        legs: List[Dict[str, Any]],
+        breakevens: List[float],
+        net_cost: float,
+        S: float,
+        T: float,
+        r: float,
+        q: float,
+        sigma: float
+    ) -> float:
+        """
+        ÅšcisÅ‚e wyliczenie PrawdopodobieÅ„stwa Zysku (Probability of Profit â€“ PoP).
+        CaÅ‚kuje analitycznie rozkÅ‚ad log-normalny forwardu P(S_T in Zysk).
+        """
+        if T <= 1e-7 or sigma <= 1e-4 or S <= 0.0:
+            pnl_now = cls.evaluate_terminal_payoff(legs, S, net_cost)
+            return 1.0 if pnl_now > 0.0 else 0.0
+
+        forward = S * math.exp((r - q) * T)
+        std_dev = sigma * math.sqrt(T)
+
+        def cdf_at(x: float) -> float:
+            if x <= 0.0:
+                return 0.0
+            d2 = (math.log(forward / x) - 0.5 * (sigma ** 2.0) * T) / std_dev
+            return float(norm.cdf(-d2))  # P(S_T <= x)
+
+        if not breakevens:
+            sample_pnl = cls.evaluate_terminal_payoff(legs, S, net_cost)
+            return 1.0 if sample_pnl > 0.0 else 0.0
+
+        intervals = [0.0] + breakevens + [float("inf")]
+        pop_total = 0.0
+
+        for i in range(len(intervals) - 1):
+            lower = intervals[i]
+            upper = intervals[i + 1]
+
+            if math.isinf(upper):
+                test_point = lower + 10.0
+            else:
+                test_point = (lower + upper) / 2.0
+
+            pnl_test = cls.evaluate_terminal_payoff(legs, test_point, net_cost)
+            if pnl_test > 1e-7:
+                p_upper = 1.0 if math.isinf(upper) else cdf_at(upper)
+                p_lower = cdf_at(lower)
+                pop_total += max(0.0, p_upper - p_lower)
+
+        return round(float(min(1.0, max(0.0, pop_total))), 4)
+
+    @classmethod
+    def calculate_expected_value(
+        cls,
+        legs: List[Dict[str, Any]],
+        S: float,
+        T: float,
+        r: float,
+        q: float,
+        fair_iv: Optional[float] = None,
+        net_cost: float = 0.0,
+        capital_at_risk: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """
+        Wyznacza wartoÅ›Ä‡ oczekiwanÄ… wypÅ‚aty i przewagÄ™ statystycznÄ… (EV Edge).
+        Zgodnie z wycenÄ… martyngaÅ‚owÄ… w walucie rozliczeniowej (USDC):
+        E[Gross_Payout] = V_0 * exp(r * T)
+        Wycenia kaÅ¼dÄ… nogÄ™ wedÅ‚ug jej indywidualnego IV (Volatility Skew),
+        zabezpieczajÄ…c przed spÅ‚aszczaniem struktury uÅ›miechu zmiennoÅ›ci.
+        """
+        if T <= 1e-7:
+            pnl_terminal = cls.evaluate_terminal_payoff(legs, S, net_cost)
+            car = capital_at_risk if (capital_at_risk is not None and capital_at_risk > 0.0) else (
+                net_cost if net_cost > 0.0 else abs(pnl_terminal)
+            )
+            roi = round(float(pnl_terminal / car * 100.0), 2) if car > 0.0 else 0.0
+            return {
+                "fair_portfolio_pv_usd": round(float(pnl_terminal + net_cost), 4),
+                "expected_gross_payout_usd": round(float(pnl_terminal + net_cost), 4),
+                "expected_net_ev_usd": round(float(pnl_terminal), 4),
+                "capital_at_risk_usd": round(float(car), 4),
+                "expected_roi_pct": roi
+            }
+
+        # GotÃ³wka USDC akumuluje siÄ™ wyÅ‚Ä…cznie stopÄ… wolnÄ… od ryzyka r
+        compounding_factor = math.exp(r * T)
+        fair_portfolio_pv = 0.0
+
+        for leg in legs:
+            K = float(leg.get("strike", S))
+            opt_type = str(leg.get("option_type", "CALL")).upper()
+            side = leg.get("side", "BUY")
+            amount = float(leg.get("amount", 1.0))
+            weight = PortfolioGreeksEngine.parse_leg_weight(side, amount)
+
+            # ÅšCISÅE ZACHOWANIE SKEW: Priorytet dla indywidualnego IV nogi
+            leg_iv = float(leg.get("iv") or fair_iv or 0.60)
+
+            model_price = BlackScholesEngine.price(
+                S=S, K=K, T=T, r=r, sigma=leg_iv, q=q, option_type=opt_type
+            )
+            fair_portfolio_pv += weight * model_price
+
+        # WartoÅ›Ä‡ oczekiwana wypÅ‚aty terminalnej
+        expected_gross_payout = fair_portfolio_pv * compounding_factor
+        expected_net_ev = expected_gross_payout - net_cost
+
+        # Obliczenie kapitaÅ‚u naraÅ¼onego na ryzyko (Capital at Risk / Depozyt)
+        if capital_at_risk is not None and capital_at_risk > 0.0:
+            car = capital_at_risk
+        elif net_cost > 0.0:
+            car = net_cost
+        else:
+            car = abs(net_cost) if abs(net_cost) > 0.0 else 1.0
+
+        expected_roi = round(float(expected_net_ev / car * 100.0), 2) if car > 0.0 else 0.0
+
+        return {
+            "fair_portfolio_pv_usd": round(fair_portfolio_pv, 4),
+            "expected_gross_payout_usd": round(expected_gross_payout, 4),
+            "expected_net_ev_usd": round(expected_net_ev, 4),
+            "capital_at_risk_usd": round(car, 4),
+            "expected_roi_pct": expected_roi
+        }
+
+    @classmethod
+    def analyze_spread_payoff(
+        cls,
+        legs: List[Dict[str, Any]],
+        S: float,
+        T: float,
+        r: float = 0.05,
+        q: float = 0.0,
+        fair_iv: Optional[float] = None,
+        exchange: str = "derive",
+        custom_fee_per_leg: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """
+        GÅ‚Ã³wna metoda analityczna. Dokonuje caÅ‚oÅ›ciowej oceny opÅ‚acalnoÅ›ci:
+        Max Profit, Max Loss, Capital at Risk, R/R, Breakevens, PoP, EV oraz koszty transakcyjne.
+        """
+        if not legs or S <= 0.0:
+            return {"error": "BÅ‚Ä™dne parametry wejÅ›ciowe lub brak nÃ³g spreadu."}
+
+        # 1. Rozliczenie przepÅ‚ywÃ³w pieniÄ™Å¼nych (Cash Flow) i prowizji
+        total_premium_paid = 0.0
+        total_fees = 0.0
+        strikes = []
+
+        for leg in legs:
+            K = float(leg.get("strike", S))
+            strikes.append(K)
+            amount = float(leg.get("amount", 1.0))
+            side = leg.get("side", "BUY")
+            weight = PortfolioGreeksEngine.parse_leg_weight(side, amount)
+
+            leg_price = float(leg.get("entry_price") or leg.get("mark") or leg.get("price") or 0.0)
+            total_premium_paid += weight * leg_price
+
+            if custom_fee_per_leg is not None:
+                total_fees += custom_fee_per_leg * abs(amount)
+            else:
+                total_fees += cls.calculate_leg_fee(
+                    spot=S, premium=leg_price, amount=amount, exchange=exchange
+                )
+
+        net_entry_cost = total_premium_paid + total_fees
+        is_debit = net_entry_cost > 0.0
+        structure_type = "DEBIT_SPREAD" if is_debit else "CREDIT_SPREAD"
+
+        # 2. Analiza asymptotyczna (Wykrywanie nieograniczonego ryzyka lub zysku)
+        slope_at_inf = 0.0
+        for leg in legs:
+            amount = float(leg.get("amount", 1.0))
+            side = leg.get("side", "BUY")
+            w = PortfolioGreeksEngine.parse_leg_weight(side, amount)
+            opt_type = str(leg.get("option_type", "CALL")).upper()
+            if opt_type == "CALL":
+                slope_at_inf += w * 1.0
+
+        is_profit_unbounded = slope_at_inf > 1e-7
+        is_loss_unbounded = slope_at_inf < -1e-7
+
+        # 3. Badanie ekstremÃ³w w punktach osobliwych
+        crit_points = [0.0] + sorted(strikes) + [max(strikes) * 2.0]
+        crit_pnls = [cls.evaluate_terminal_payoff(legs, pt, net_entry_cost) for pt in crit_points]
+
+        max_profit = float("inf") if is_profit_unbounded else max(crit_pnls)
+        max_loss = -float("inf") if is_loss_unbounded else min(crit_pnls)
+
+        # 4. Wyznaczenie kapitaÅ‚u naraÅ¼onego na ryzyko (Capital at Risk)
+        if is_loss_unbounded:
+            capital_at_risk = float("inf")
+        elif is_debit:
+            capital_at_risk = net_entry_cost
+        else:
+            capital_at_risk = abs(max_loss) if abs(max_loss) > 0.0 else abs(net_entry_cost)
+
+        # 5. Wyznaczenie wskaÅºnikÃ³w asymetrii Risk / Reward
+        if math.isinf(max_profit) or math.isinf(max_loss) or max_profit <= 0.0 or max_loss >= 0.0:
+            risk_reward_ratio = None
+            reward_to_risk_ratio = None
+        else:
+            risk = abs(max_loss)
+            reward = max_profit
+            risk_reward_ratio = round(risk / reward, 4) if reward > 0.0 else None
+            reward_to_risk_ratio = round(reward / risk, 4) if risk > 0.0 else None
+
+        # 6. Analityczne Breakevens
+        breakevens = cls._find_exact_breakevens(legs, net_entry_cost)
+
+        # 7. PrawdopodobieÅ„stwo Zysku (PoP)
+        ref_iv = fair_iv if fair_iv is not None else float(legs[0].get("iv") or 0.60)
+        pop = cls.calculate_pop(
+            legs=legs,
+            breakevens=breakevens,
+            net_cost=net_entry_cost,
+            S=S,
+            T=T,
+            r=r,
+            q=q,
+            sigma=ref_iv
+        )
+
+        # 8. WartoÅ›Ä‡ Oczekiwana (EV) z zachowaniem peÅ‚nego Skew (fair_iv przekazywane wprost)
+        ev_metrics = cls.calculate_expected_value(
+            legs=legs,
+            S=S,
+            T=T,
+            r=r,
+            q=q,
+            fair_iv=fair_iv,
+            net_cost=net_entry_cost,
+            capital_at_risk=capital_at_risk if not math.isinf(capital_at_risk) else None
+        )
+
+        return {
+            "structure_type": structure_type,
+            "net_premium_usd": round(total_premium_paid, 4),
+            "total_fees_usd": round(total_fees, 4),
+            "net_entry_cost_usd": round(net_entry_cost, 4),
+            "capital_at_risk_usd": round(capital_at_risk, 4) if not math.isinf(capital_at_risk) else "UNBOUNDED",
+            "max_profit_usd": round(max_profit, 4) if not math.isinf(max_profit) else "UNBOUNDED",
+            "max_loss_usd": round(max_loss, 4) if not math.isinf(max_loss) else "UNBOUNDED",
+            "is_profit_unbounded": is_profit_unbounded,
+            "is_loss_unbounded": is_loss_unbounded,
+            "risk_reward_ratio": risk_reward_ratio,
+            "reward_to_risk_ratio": reward_to_risk_ratio,
+            "breakeven_points": breakevens,
+            "probability_of_profit_pct": round(pop * 100.0, 2),
+            "expected_value_usd": ev_metrics["expected_net_ev_usd"],
+            "expected_roi_pct": ev_metrics["expected_roi_pct"] if not math.isinf(capital_at_risk) else None,
+            "is_ev_positive": ev_metrics["expected_net_ev_usd"] > 0.0
+        }
+
+    @classmethod
+    def generate_payoff_curve(
+        cls,
+        legs: List[Dict[str, Any]],
+        S: float,
+        T: float,
+        sigma: float = 0.60,
+        net_cost: Optional[float] = None,
+        num_points: int = 250
+    ) -> pd.DataFrame:
+        """
+        Generuje nieliniowÄ…, gÄ™stÄ… wektorowÄ… siatkÄ™ profilu PnL w caÅ‚ym spektrum cenowym.
+        """
+        if net_cost is None:
+            net_cost = sum(
+                PortfolioGreeksEngine.parse_leg_weight(l.get("side", "BUY"), l.get("amount", 1.0)) *
+                float(l.get("entry_price") or l.get("mark") or 0.0)
+                for l in legs
+            )
+
+        strikes = [float(l["strike"]) for l in legs if "strike" in l]
+        min_k = min(strikes) if strikes else S * 0.8
+        max_k = max(strikes) if strikes else S * 1.2
+
+        std_range = sigma * math.sqrt(max(T, 7.0 / cls.DAYS_PER_YEAR))
+        s_min = max(1.0, min(S * math.exp(-3.5 * std_range), min_k * 0.75))
+        s_max = max(S * math.exp(3.5 * std_range), max_k * 1.25)
+
+        grid_base = np.linspace(s_min, s_max, num_points)
+        special_pts = np.array([S] + strikes)
+        full_grid = np.unique(np.sort(np.concatenate([grid_base, special_pts])))
+
+        pnl_values = cls.evaluate_terminal_payoff(legs, full_grid, net_cost)
+
+        df = pd.DataFrame({
+            "spot_price": np.round(full_grid, 2),
+            "net_pnl": np.round(pnl_values, 4),
+            "roi_pct": np.round((pnl_values / net_cost * 100.0) if net_cost > 0 else 0.0, 2)
+        })
+        return df
+
+
+==================================================
+PLIK: \src\quant\projection.py
+==================================================
+import os
+import sys
+import math
+from typing import Dict, Any, List, Optional
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+
+try:
+    from tabulate import tabulate
+    HAS_TABULATE = True
+except ImportError:
+    HAS_TABULATE = False
+
+
+class PriceProjectionEngine:
+    """
+    Rygorystyczny silnik projekcji prawdopodobienstwa i stozkow cenowych.
+    Wylicza przedzialy ufnosci w czasie oraz analityczne prawdopodobienstwo
+    dotkniecia poziomow docelowych (First-Passage Time / Probability of Touching).
+    W pelni uwzglednia korekte Ito dla geometrycznego ruchu Browna (GBM).
+    """
+
+    DAYS_PER_YEAR: float = 365.0
+
+    @classmethod
+    def calculate_first_passage_touch(
+        cls,
+        spot: float,
+        barrier: float,
+        time_years: float,
+        volatility: float,
+        drift: float
+    ) -> float:
+        """
+        Scisle analityczne prawdopodobienstwo dotkniecia bariery cenowej
+        w dowolnym momencie w przedziale czasu [0, time_years].
+        Zabezpieczone obustronnie przed przepelnieniem wykladniczym.
+        """
+        if time_years <= 1e-6 or volatility <= 1e-4 or spot <= 0.0 or barrier <= 0.0:
+            return 1.0 if (spot >= barrier if barrier >= spot else spot <= barrier) else 0.0
+
+        if math.isclose(spot, barrier, rel_tol=1e-5):
+            return 1.0
+
+        # Dryf procesu logarytmicznego: nu = mu - 0.5 * sigma^2
+        nu = drift - 0.5 * (volatility ** 2.0)
+        denom = volatility * math.sqrt(time_years)
+
+        # Bariera gorna (Upper Barrier: H > Spot)
+        if barrier > spot:
+            m = math.log(barrier / spot)
+            term1 = norm.cdf((-m + nu * time_years) / denom)
+            expo = (2.0 * nu * m) / (volatility ** 2.0)
+            
+            # Obustronne zabezpieczenie numeryczne
+            if abs(expo) > 700.0:
+                term2 = 0.0
+            else:
+                term2 = math.exp(expo) * norm.cdf((-m - nu * time_years) / denom)
+                
+            pot = term1 + term2
+            return float(min(1.0, max(0.0, pot)))
+
+        # Bariera dolna (Lower Barrier: L < Spot)
+        else:
+            m = math.log(barrier / spot)  # wartosc ujemna
+            term1 = norm.cdf((m - nu * time_years) / denom)
+            expo = (2.0 * nu * m) / (volatility ** 2.0)
+            
+            # Obustronne zabezpieczenie numeryczne
+            if abs(expo) > 700.0:
+                term2 = 0.0
+            else:
+                term2 = math.exp(expo) * norm.cdf((m + nu * time_years) / denom)
+                
+            pot = term1 + term2
+            return float(min(1.0, max(0.0, pot)))
+
+    @classmethod
+    def calculate_expiring_beyond(
+        cls,
+        spot: float,
+        target: float,
+        time_years: float,
+        volatility: float,
+        drift: float,
+        is_upper: bool = True
+    ) -> float:
+        """
+        Prawdopodobienstwo zakonczenia wygasniecia za celem cenowym w momencie T.
+        """
+        if time_years <= 1e-6 or volatility <= 1e-4:
+            return 1.0 if (spot >= target if is_upper else spot <= target) else 0.0
+
+        nu = drift - 0.5 * (volatility ** 2.0)
+        denom = volatility * math.sqrt(time_years)
+
+        if is_upper:
+            d2 = (math.log(spot / target) + nu * time_years) / denom
+            return float(norm.cdf(d2))
+        else:
+            d2 = (math.log(target / spot) - nu * time_years) / denom
+            return float(norm.cdf(d2))
+
+    @classmethod
+    def build_confidence_cones(
+        cls,
+        spot: float,
+        dte_days: float,
+        volatility: float,
+        drift: float
+    ) -> pd.DataFrame:
+        """
+        Generuje korytarze stozka zmiennosci dla 50%, 68.3% (1-sigma) i 95.4% (2-sigmy)
+        wycentrowane scisle na medianie geometrycznej (korekta Ito).
+        """
+        checkpoints = []
+        for d in [7.0, 14.0, 21.0, dte_days]:
+            if d <= dte_days and d not in checkpoints:
+                checkpoints.append(d)
+        if dte_days not in checkpoints:
+            checkpoints.append(dte_days)
+        checkpoints = sorted(checkpoints)
+
+        rows = []
+        for days in checkpoints:
+            t_yrs = days / cls.DAYS_PER_YEAR
+            
+            # Srodek rozkladu log-normalnego (mediana) z korekta Ito: -0.5 * sigma^2
+            nu = drift - 0.5 * (volatility ** 2.0)
+            median_forward = spot * math.exp(nu * t_yrs)
+            
+            # Wartosc oczekiwana (srednia arytmetyczna forwardu)
+            mean_forward = spot * math.exp(drift * t_yrs)
+            
+            std_dev = volatility * math.sqrt(t_yrs)
+
+            # Poziom 50% (Z = 0.67449)
+            low_50 = median_forward * math.exp(-0.67449 * std_dev)
+            high_50 = median_forward * math.exp(0.67449 * std_dev)
+
+            # Poziom 68.27% (1-sigma, Z = 1.0)
+            low_68 = median_forward * math.exp(-1.0 * std_dev)
+            high_68 = median_forward * math.exp(1.0 * std_dev)
+
+            # Poziom 95.45% (2-sigma, Z = 1.95996)
+            low_95 = median_forward * math.exp(-1.95996 * std_dev)
+            high_95 = median_forward * math.exp(1.95996 * std_dev)
+
+            rows.append({
+                "HORYZONT": f"{days:.1f} dni",
+                "MEDIANA (ITO)": f"{median_forward:.2f} USD",
+                "SREDNIA FWD": f"{mean_forward:.2f} USD",
+                "PASMO 50% (DOL - GORA)": f"{low_50:.2f} - {high_50:.2f} USD",
+                "PASMO 68% (1-SIGMA)": f"{low_68:.2f} - {high_68:.2f} USD",
+                "PASMO 95% (2-SIGMY)": f"{low_95:.2f} - {high_95:.2f} USD"
+            })
+
+        return pd.DataFrame(rows)
+
+    @classmethod
+    def evaluate_spread_milestones(
+        cls,
+        spot: float,
+        dte_days: float,
+        volatility: float,
+        drift: float,
+        strategy_row: Dict[str, Any]
+    ) -> pd.DataFrame:
+        """
+        Wylicza matryce celow dla wybranego spreadu z pelna normalizacja kontraktu
+        i wlasciwym kierunkiem dla strategii byczych i niedzwiedzich.
+        """
+        t_total = dte_days / cls.DAYS_PER_YEAR
+        
+        # 1. Defensywna normalizacja kontraktu strategii
+        strat_raw = str(strategy_row.get("STRATEGY") or strategy_row.get("STRAT") or "").strip().upper()
+        if "BULL" in strat_raw:
+            is_bull = True
+        elif "BEAR" in strat_raw:
+            is_bull = False
+        else:
+            raise ValueError(f"Nieznany typ strategii: {strat_raw}. Oczekiwano prefiksu BULL lub BEAR.")
+
+        k_long = float(strategy_row["LONG_K"])
+        k_short = float(strategy_row["SHORT_K"])
+        cost = abs(float(strategy_row["NET_COST"]))
+        max_win = float(strategy_row["MAX_WIN"])
+
+        # 2. Bezpieczna obsluga progu rentownosci (odpornosc na None/NaN)
+        raw_be = strategy_row.get("BREAKEVEN")
+        if raw_be is not None and not pd.isna(raw_be):
+            breakeven = float(raw_be)
+        else:
+            breakeven = (k_long + cost) if is_bull else (k_long - cost)
+
+        # 3. Definicja 3 kluczowych poziomow kierunkowych
+        if is_bull:
+            t1_price = breakeven
+            t1_desc = "Prog rentownosci (Breakeven - wyjscie na zero)"
+
+            t2_price = k_long + cost + 0.5 * max_win
+            t2_desc = "Cel 50% maksymalnego zysku (Wczesny Take Profit)"
+
+            t3_price = k_short
+            t3_desc = "Cel 100% pelnego zysku (Short Strike)"
+        else:
+            t1_price = breakeven
+            t1_desc = "Prog rentownosci (Breakeven - wyjscie na zero)"
+
+            t2_price = k_long - cost - 0.5 * max_win
+            t2_desc = "Cel 50% maksymalnego zysku (Wczesny Take Profit)"
+
+            t3_price = k_short
+            t3_desc = "Cel 100% pelnego zysku (Short Strike)"
+
+        targets = [
+            (t1_desc, t1_price),
+            (t2_desc, t2_price),
+            (t3_desc, t3_price)
+        ]
+
+        rows = []
+        for desc, p_target in targets:
+            # Prawdopodobienstwo dotkniecia przed wygasnieciem (PoT)
+            pot = cls.calculate_first_passage_touch(
+                spot=spot,
+                barrier=p_target,
+                time_years=t_total,
+                volatility=volatility,
+                drift=drift
+            )
+
+            # Prawdopodobienstwo zakonczenia na wygasnieciu za celem (PoE)
+            poe = cls.calculate_expiring_beyond(
+                spot=spot,
+                target=p_target,
+                time_years=t_total,
+                volatility=volatility,
+                drift=drift,
+                is_upper=is_bull
+            )
+
+            diff_usd = p_target - spot
+            diff_pct = (diff_usd / spot) * 100.0
+
+            rows.append({
+                "KAMIEÅƒ MILOWY": desc,
+                "KURS CELU": f"{p_target:.2f} USD",
+                "DYSTANS OD SPOT": f"{diff_usd:+.2f} USD ({diff_pct:+.1f}%)",
+                "SZANSA DOTKNIECIA (PoT)": f"{pot * 100.0:.1f}%",
+                "SZANSA NA WYGASNIECIU (PoE)": f"{poe * 100.0:.1f}%"
+            })
+
+        return pd.DataFrame(rows)
+
+    @classmethod
+    def display_projection_report(
+        cls,
+        spot: float,
+        volatility: float,
+        drift: float,
+        strategy_row: Dict[str, Any]
+    ):
+        strat = str(strategy_row.get("STRATEGY") or strategy_row.get("STRAT") or "STRATEGIA").upper()
+        exp = strategy_row.get("EXPIRY", "")
+        dte = float(strategy_row.get("DTE", 0.0))
+        k_long = strategy_row.get("LONG_K")
+        k_short = strategy_row.get("SHORT_K")
+        cost = strategy_row.get("NET_COST")
+        max_win = strategy_row.get("MAX_WIN")
+        rr = strategy_row.get("RR_RATIO")
+
+        print("\n========================================================================================================================")
+        print(f"                       RAPORT PROJEKCJI PRAWDOPODOBIENSTWA DLA: {strat} {k_long} / {k_short} ({exp})")
+        print("========================================================================================================================")
+        print(f"Biezacy kurs SOL:  {spot:.2f} USD | Czas do wygasniecia (DTE): {dte:.1f} dni")
+        print(f"Uzyta zmiennosc:   {volatility * 100.0:.2f}% | Roczny dryf modelu (r - q): {drift * 100.0:.2f}%")
+        print(f"Parametry pozycji: Koszt: {cost} USD | Max Zysk: {max_win} USD | Stosunek R/R: {rr}")
+        print("------------------------------------------------------------------------------------------------------------------------")
+
+        # 1. Tabela stozka zmiennosci wycentrowana na medianie Ito
+        print("\n[1] STOZEK ZMIENNOSCI (KORYTARZE PRAWDOPODOBIENSTWA CENY SOL W CZASIE):")
+        df_cones = cls.build_confidence_cones(spot=spot, dte_days=dte, volatility=volatility, drift=drift)
+        if HAS_TABULATE:
+            print(tabulate(df_cones, headers="keys", tablefmt="fancy_grid", showindex=False))
+        else:
+            print(df_cones.to_string(index=False))
+
+        # 2. Tabela szansy realizacji celow
+        print("\n[2] MATRYCA REALIZACJI CELOW POZYCJI (DOTKNIECIE W TRAKCIE VS ZAKONCZENIE NA WYGASNIECIU):")
+        df_targets = cls.evaluate_spread_milestones(
+            spot=spot, dte_days=dte, volatility=volatility, drift=drift, strategy_row=strategy_row
+        )
+        if HAS_TABULATE:
+            print(tabulate(df_targets, headers="keys", tablefmt="fancy_grid", showindex=False))
+        else:
+            print(df_targets.to_string(index=False))
+
+        print("========================================================================================================================\n")
+
+
+==================================================
+PLIK: \src\quant\volatility.py
+==================================================
+import os
+import sys
+import math
+from typing import Dict, Any, List, Optional
+import numpy as np
+import pandas as pd
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+
+class VolatilityEngine:
+    """
+    Rygorystyczny, zoptymalizowany numerycznie silnik estymacji zmiennoÅ›ci zrealizowanej (RV),
+    dynamicznej klasyfikacji reÅ¼imÃ³w rynkowych oraz adaptacyjnej premii za ryzyko zmiennoÅ›ci (VRP).
+    DziaÅ‚a w pamiÄ™ci RAM w oparciu o wektoryzacjÄ™ NumPy, zachowujÄ…c Å›cisÅ‚y standard krypto ACT/365.0.
+    """
+
+    # Standard rynkowy krypto ACT/365.0 (24h na dobÄ™, 365 dni w roku)
+    ANNUALIZATION_DAILY: float = 365.0
+    ANNUALIZATION_HOURLY: float = 365.0 * 24.0  # DokÅ‚adnie 8760.0 godzin w roku
+
+    PI_OVER_2: float = math.pi / 2.0                       # ~1.57079633 (staÅ‚a Bipower Variation)
+    GARMAN_KLASS_CONST: float = 2.0 * math.log(2.0) - 1.0  # ~0.38629436
+    PARKINSON_CONST: float = 1.0 / (4.0 * math.log(2.0))   # ~0.36067376
+
+    @classmethod
+    def _sanitize_ohlc(cls, df: pd.DataFrame, req_cols: set) -> pd.DataFrame:
+        """
+        Odrzuca Å›wiece uszkodzone, niekompletne lub niefizyczne (ceny <= 0, high < low).
+        """
+        if df.empty or not req_cols.issubset(df.columns):
+            return pd.DataFrame()
+
+        cond = pd.Series(True, index=df.index)
+        for col in req_cols:
+            numeric_col = pd.to_numeric(df[col], errors="coerce")
+            cond = cond & (numeric_col > 0.0)
+
+        if "high" in req_cols and "low" in req_cols:
+            cond = cond & (pd.to_numeric(df["high"], errors="coerce") >= pd.to_numeric(df["low"], errors="coerce"))
+
+        return df[cond].copy()
+
+    @classmethod
+    def calculate_log_returns(cls, df: pd.DataFrame, price_col: str = "close") -> pd.Series:
+        """
+        Oblicza logarytmiczne stopy zwrotu po odrzuceniu cen niedodatnich.
+        """
+        if price_col not in df.columns or len(df) < 2:
+            return pd.Series(dtype=float)
+
+        prices = pd.to_numeric(df[price_col], errors="coerce")
+        valid_prices = prices[prices > 0.0]
+        if len(valid_prices) < 2:
+            return pd.Series(dtype=float)
+
+        return np.log(valid_prices / valid_prices.shift(1)).dropna()
+
+    @classmethod
+    def close_to_close(
+        cls,
+        df: pd.DataFrame,
+        annualization_factor: float = ANNUALIZATION_HOURLY,
+        ddof: int = 1
+    ) -> float:
+        """
+        Klasyczny estymator zmiennoÅ›ci zrealizowanej Close-to-Close.
+        """
+        log_ret = cls.calculate_log_returns(df, price_col="close")
+        if len(log_ret) < 2:
+            return 0.0
+        return float(math.sqrt(max(log_ret.var(ddof=ddof), 0.0) * annualization_factor))
+
+    @classmethod
+    def parkinson(
+        cls,
+        df: pd.DataFrame,
+        annualization_factor: float = ANNUALIZATION_HOURLY
+    ) -> float:
+        """
+        Estymator Parkinsona oparty na rozpiÄ™toÅ›ci High-Low.
+        Odporny na luki danych i zera w arkuszu.
+        """
+        df_clean = cls._sanitize_ohlc(df, {"high", "low"})
+        if len(df_clean) < 1:
+            return 0.0
+
+        high = df_clean["high"].astype(float).values
+        low = df_clean["low"].astype(float).values
+
+        ratio = high / low
+        ratio = np.maximum(ratio, 1.0)
+        log_hl_sq = np.log(ratio) ** 2.0
+        variance = cls.PARKINSON_CONST * np.mean(log_hl_sq)
+
+        return float(math.sqrt(max(variance, 0.0) * annualization_factor))
+
+    @classmethod
+    def garman_klass(
+        cls,
+        df: pd.DataFrame,
+        annualization_factor: float = ANNUALIZATION_HOURLY
+    ) -> float:
+        """
+        Estymator Garmana-Klassa (OHLC). Wykorzystuje peÅ‚nÄ… informacjÄ™ wewnÄ…trzÅ›wiecowÄ….
+        Zabezpieczony przed ujemnÄ… wariancjÄ… resztkowÄ… oraz bÅ‚Ä™dami feedu.
+        """
+        df_clean = cls._sanitize_ohlc(df, {"open", "high", "low", "close"})
+        if len(df_clean) < 1:
+            return 0.0
+
+        open_p = df_clean["open"].astype(float).values
+        high_p = df_clean["high"].astype(float).values
+        low_p = df_clean["low"].astype(float).values
+        close_p = df_clean["close"].astype(float).values
+
+        ratio_hl = np.maximum(high_p / low_p, 1.0)
+        ratio_co = close_p / open_p
+
+        term1 = 0.5 * (np.log(ratio_hl) ** 2.0)
+        term2 = cls.GARMAN_KLASS_CONST * (np.log(ratio_co) ** 2.0)
+
+        # Kluczowe zabezpieczenie: rÃ³Å¼nica na poziomie Å›wiecy nie moÅ¼e byÄ‡ ujemna
+        diff = np.maximum(term1 - term2, 0.0)
+        variance = np.mean(diff)
+
+        return float(math.sqrt(max(variance, 0.0) * annualization_factor))
+
+    @classmethod
+    def jump_robust_bipower_variation(
+        cls,
+        df: pd.DataFrame,
+        annualization_factor: float = ANNUALIZATION_HOURLY
+    ) -> float:
+        """
+        Odporny na skoki cenowe estymator Bipower Variation (Barndorff-Nielsen & Shephard).
+        Filtruje znieksztaÅ‚cenia wywoÅ‚ane jednorazowymi flash-crashami lub pompami.
+        """
+        log_ret = cls.calculate_log_returns(df, price_col="close").values
+        n = len(log_ret)
+        if n < 2:
+            return 0.0
+
+        abs_ret = np.abs(log_ret)
+        bipower_sum = np.sum(abs_ret[1:] * abs_ret[:-1])
+        variance = cls.PI_OVER_2 * (bipower_sum / (n - 1))
+
+        return float(math.sqrt(max(variance, 0.0) * annualization_factor))
+
+    @classmethod
+    def rolling_garman_klass(
+        cls,
+        df: pd.DataFrame,
+        window: int = 24,
+        annualization_factor: float = ANNUALIZATION_HOURLY
+    ) -> pd.Series:
+        """
+        KroczÄ…ca zmiennoÅ›Ä‡ zrealizowana Garmana-Klassa w zadanym oknie czasowym.
+        """
+        df_clean = cls._sanitize_ohlc(df, {"open", "high", "low", "close"})
+        if len(df_clean) < window:
+            return pd.Series(dtype=float)
+
+        open_p = df_clean["open"].astype(float)
+        high_p = df_clean["high"].astype(float)
+        low_p = df_clean["low"].astype(float)
+        close_p = df_clean["close"].astype(float)
+
+        ratio_hl = np.maximum(high_p / low_p, 1.0)
+        ratio_co = close_p / open_p
+
+        term1 = 0.5 * (np.log(ratio_hl) ** 2.0)
+        term2 = cls.GARMAN_KLASS_CONST * (np.log(ratio_co) ** 2.0)
+        diff = np.maximum(term1 - term2, 0.0)
+
+        rolling_var = diff.rolling(window=window).mean()
+        rolling_var = np.maximum(rolling_var, 0.0)
+
+        rolling_vol = np.sqrt(rolling_var * annualization_factor)
+        return rolling_vol.dropna()
+
+    @classmethod
+    def classify_volatility_regime(
+        cls,
+        rolling_rv_series: pd.Series,
+        current_rv: float,
+        q_low: float = 0.25,
+        q_high: float = 0.75
+    ) -> Dict[str, Any]:
+        """
+        Klasyfikuje reÅ¼im zmiennoÅ›ci rynkowej na podstawie rozkÅ‚adu empirycznego.
+        ÅšciÅ›le ujednolica schemat zwracanych kluczy sÅ‚ownika (brak ryzyka KeyError w downstreamie).
+        """
+        # Standaryzowany kontrakt sÅ‚ownika dla stanu niepeÅ‚nych danych
+        if len(rolling_rv_series) < 10:
+            return {
+                "regime": "INSUFFICIENT_DATA",
+                "current_rv": round(current_rv, 4),
+                "percentile_rank": 0.50,
+                "q25": 0.0,
+                "median": 0.0,
+                "q75": 0.0
+            }
+
+        q25 = float(np.percentile(rolling_rv_series, q_low * 100.0))
+        median = float(np.median(rolling_rv_series))
+        q75 = float(np.percentile(rolling_rv_series, q_high * 100.0))
+
+        percentile_rank = float(np.mean(rolling_rv_series <= current_rv))
+
+        if current_rv < q25:
+            regime = "LOW_VOLATILITY"
+        elif current_rv > q75:
+            regime = "HIGH_VOLATILITY"
+        else:
+            regime = "NORMAL_VOLATILITY"
+
+        return {
+            "regime": regime,
+            "current_rv": round(current_rv, 4),
+            "percentile_rank": round(percentile_rank, 4),
+            "q25": round(q25, 4),
+            "median": round(median, 4),
+            "q75": round(q75, 4)
+        }
+
+    @classmethod
+    def calculate_adaptive_vrp(
+        cls,
+        iv: float,
+        rv: float,
+        regime_info: Optional[Dict[str, Any]] = None,
+        rolling_vrp_series: Optional[pd.Series] = None,
+        dte: Optional[float] = None,
+        rv_horizon_days: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """
+        Oblicza adaptacyjnÄ… premiÄ™ za ryzyko zmiennoÅ›ci (VRP = IV - RV).
+        Zapewnia spÃ³jnoÅ›Ä‡ progÃ³w decyzyjnych z reÅ¼imem rynkowym oraz monitoruje
+        dopasowanie horyzontu czasowego (term structure horizon consistency).
+        """
+        vrp_abs = iv - rv
+        vrp_rel = (vrp_abs / rv) if rv > 0.0 else 0.0
+
+        z_score = None
+        vrp_percentile = None
+
+        if rolling_vrp_series is not None and len(rolling_vrp_series) >= 10:
+            mean_vrp = float(np.mean(rolling_vrp_series))
+            std_vrp = float(np.std(rolling_vrp_series, ddof=1))
+            if std_vrp > 1e-8:
+                z_score = round(float((vrp_abs - mean_vrp) / std_vrp), 2)
+            vrp_percentile = round(float(np.mean(rolling_vrp_series <= vrp_abs)), 4)
+
+        regime = regime_info.get("regime", "NORMAL_VOLATILITY") if regime_info else "NORMAL_VOLATILITY"
+
+        # Adaptacja progÃ³w Z-Score oraz progÃ³w relatywnych do zidentyfikowanego reÅ¼imu
+        if regime == "LOW_VOLATILITY":
+            z_sell_threshold, z_buy_threshold = 1.2, -1.8
+            rich_rel_threshold, cheap_rel_threshold = 0.20, 0.00
+        elif regime == "HIGH_VOLATILITY":
+            z_sell_threshold, z_buy_threshold = 1.8, -1.2
+            rich_rel_threshold, cheap_rel_threshold = 0.15, -0.05
+        else:
+            z_sell_threshold, z_buy_threshold = 1.5, -1.5
+            rich_rel_threshold, cheap_rel_threshold = 0.18, 0.00
+
+        # Weryfikacja spÃ³jnoÅ›ci horyzontÃ³w czasowych
+        term_structure_mismatch = False
+        if dte is not None and rv_horizon_days is not None:
+            # Flaga ostrzegawcza, jeÅ›li horyzonty rÃ³Å¼niÄ… siÄ™ ponad 2-krotnie
+            if max(dte, rv_horizon_days) / max(min(dte, rv_horizon_days), 1e-4) > 2.0:
+                term_structure_mismatch = True
+
+        if z_score is not None:
+            if z_score >= z_sell_threshold:
+                signal = "OVERPRICED_SELL_PREMIUM"
+            elif z_score <= z_buy_threshold:
+                signal = "UNDERPRICED_BUY_CONVEXITY"
+            else:
+                signal = "FAIRLY_PRICED_DIRECTIONAL"
+        else:
+            if vrp_rel >= rich_rel_threshold:
+                signal = "OVERPRICED_SELL_PREMIUM"
+            elif vrp_rel <= cheap_rel_threshold:
+                signal = "UNDERPRICED_BUY_CONVEXITY"
+            else:
+                signal = "FAIRLY_PRICED_DIRECTIONAL"
+
+        return {
+            "iv": round(iv, 4),
+            "rv": round(rv, 4),
+            "vrp_absolute": round(vrp_abs, 4),
+            "vrp_relative": round(vrp_rel, 4),
+            "vrp_relative_pct": round(vrp_rel * 100.0, 2),
+            "regime_context": regime,
+            "z_score": z_score,
+            "vrp_percentile": vrp_percentile,
+            "term_structure_mismatch": term_structure_mismatch,
+            "signal": signal
+        }
+
+    @classmethod
+    def calculate_funding_drift_adjustment(
+        cls,
+        spot: float,
+        funding_rate_8h: float,
+        T: float,
+        risk_free_rate: float = 0.05
+    ) -> Dict[str, float]:
+        """
+        Kalkulacja dryfu wyceny wywoÅ‚anego stopÄ… finansowania kontraktÃ³w perpetualnych.
+        Baza ujednolicona do 365.0 dni w roku (ACT/365.0).
+        """
+        q_perp = funding_rate_8h * 3.0 * cls.ANNUALIZATION_DAILY
+        f_traditional = spot * math.exp(risk_free_rate * T)
+        f_crypto_adj = spot * math.exp((risk_free_rate - q_perp) * T)
+        drift_diff = f_crypto_adj - f_traditional
+
+        return {
+            "spot": spot,
+            "q_perp_annualized": round(q_perp, 4),
+            "forward_traditional": round(f_traditional, 4),
+            "forward_crypto_adjusted": round(f_crypto_adj, 4),
+            "drift_impact_usd": round(drift_diff, 4)
+        }
+
+
+if __name__ == "__main__":
+    from src.data_feed.market_spot import MarketSpotClient
+    from src.data_feed.derive_client import DeriveClient
+
+    print("==================================================")
+    print("TEST MODUÅU VOLATILITYENGINE NA Å»YWYM RYNKU (RAM)")
+    print("==================================================")
+
+    spot_client = MarketSpotClient()
+    derive_client = DeriveClient()
+
+    print("1. Pobieranie Å›wiec spotowych z API...")
+    df_candles = spot_client.get_clean_spot_candles(symbol="SOLUSDC", interval="1h", limit=168, save_csv=False)
+    print(f"[OK] Pobrano {len(df_candles)} Å›wiec bezpoÅ›rednio do RAM.")
+
+    print("\n2. Pobieranie Å‚aÅ„cucha opcji z Derive...")
+    df_options = derive_client.get_clean_options_chain("SOL", min_dte=7.0, max_dte=35.0)
+    print(f"[OK] Pobrano {len(df_options)} opcji bezpoÅ›rednio do RAM.")
+
+    spot_price = df_candles.iloc[-1]["close"]
+    first_exp = df_options["expiry_str"].iloc[0]
+    exp_df = df_options[df_options["expiry_str"] == first_exp]
+
+    calls = exp_df[exp_df["option_type"] == "CALL"].sort_values(by="strike")
+    atm_idx = (calls["strike"] - spot_price).abs().idxmin()
+    atm_call = calls.loc[atm_idx]
+
+    live_iv = float(atm_call["iv"])
+    live_dte = float(atm_call["dte"])
+    atm_strike = float(atm_call["strike"])
+    print(f"[OK] Seria: {first_exp} (DTE: {live_dte}d) | Strike ATM: {atm_strike} USD | IV: {live_iv * 100:.2f}%")
+
+    print("\n3. Estymatory zmiennoÅ›ci (Baza ACT/365.0):")
+    c2c_vol = VolatilityEngine.close_to_close(df_candles)
+    park_vol = VolatilityEngine.parkinson(df_candles)
+    gk_vol = VolatilityEngine.garman_klass(df_candles)
+    bv_vol = VolatilityEngine.jump_robust_bipower_variation(df_candles)
+
+    print(f"  - Close-to-Close RV:                {c2c_vol * 100:.2f}%")
+    print(f"  - Parkinson RV (High-Low):          {park_vol * 100:.2f}%")
+    print(f"  - Garman-Klass RV (OHLC):           {gk_vol * 100:.2f}%")
+    print(f"  - Jump-Robust Bipower (Bez skokÃ³w): {bv_vol * 100:.2f}%")
+
+    rolling_gk = VolatilityEngine.rolling_garman_klass(df_candles, window=24)
+    regime_res = VolatilityEngine.classify_volatility_regime(rolling_gk, current_rv=rolling_gk.iloc[-1])
+    print(f"\n4. Diagnostyka reÅ¼imu rynkowego:")
+    print(f"  - Zidentyfikowany reÅ¼im:           {regime_res['regime']}")
+    print(f"  - BieÅ¼Ä…ce RV (24h):                {regime_res['current_rv'] * 100:.2f}%")
+    print(f"  - Progi kwantylowe:                q25={regime_res['q25']:.4f}, median={regime_res['median']:.4f}, q75={regime_res['q75']:.4f}")
+
+    vrp_res = VolatilityEngine.calculate_adaptive_vrp(
+        iv=live_iv,
+        rv=rolling_gk.iloc[-1],
+        regime_info=regime_res,
+        dte=live_dte,
+        rv_horizon_days=1.0  # Okno 24h
+    )
+    print(f"\n5. Adaptacyjny sygnaÅ‚ VRP:")
+    print(f"  - VRP WzglÄ™dny:                    {vrp_res['vrp_relative_pct']:+.2f}%")
+    print(f"  - SygnaÅ‚:                          {vrp_res['signal']}")
+    print(f"  - OstrzeÅ¼enie o horyzoncie tenoru: {vrp_res['term_structure_mismatch']}")
+
+
+==================================================
+PLIK: \src\quant\__init__.py
+==================================================
+
+
+==================================================
+PLIK: \src\strategies\risk_manager.py
+==================================================
+
+
+==================================================
+PLIK: \src\strategies\spread_screener.py
+==================================================
+import os
+import sys
+import math
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Optional, Tuple
+import numpy as np
+import pandas as pd
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from src.data_feed.deribit_client import DeribitClient
+from src.data_feed.market_spot import MarketSpotClient
+from src.quant.volatility import VolatilityEngine
+from src.quant.black_scholes import BlackScholesEngine
+from src.quant.greeks import PortfolioGreeksEngine
+from src.quant.payoff import PayoffEngine
+from src.quant.projection import PriceProjectionEngine
+
+try:
+    from tabulate import tabulate
+    HAS_TABULATE = True
+except ImportError:
+    HAS_TABULATE = False
+
+
+class SpreadScreener:
+    """
+    Skaner ilosciowy opcji SOL oparty w 100 procentach na rynku Deribit.
+    W pelni eliminuje ceny widmowe z arkusza, weryfikuje spread Bid-Ask,
+    wylicza greki, prawdopodobienstwo (PoP), wycene EV oraz stosunek R/R.
+    Zintegrowany z interaktywnym silnikiem projekcji prawdopodobienstwa.
+    """
+
+    def __init__(
+        self,
+        currency: str = "SOL",
+        min_dte: float = 18.0,
+        max_dte: float = 40.0,
+        spot_band_pct: float = 0.20,
+        min_wing_width: float = 4.0,
+        max_wing_width: float = 25.0,
+        min_pop_pct: float = 38.0,
+        max_bid_ask_spread_pct: float = 0.25
+    ):
+        self.currency = currency.upper()
+        self.min_dte = min_dte
+        self.max_dte = max_dte
+        self.exchange = "deribit"
+        self.spot_band_pct = spot_band_pct
+        self.min_wing_width = min_wing_width
+        self.max_wing_width = max_wing_width
+        self.min_pop_pct = min_pop_pct
+        self.max_bid_ask_spread_pct = max_bid_ask_spread_pct
+
+        self.deribit_client = DeribitClient()
+        self.spot_client = MarketSpotClient()
+
+    def fetch_live_market_state(self) -> Dict[str, Any]:
+        spot_price = self.deribit_client.get_spot_price(self.currency)
+
+        funding_info = self.spot_client.get_current_funding_rate(f"{self.currency}USDT")
+        q_funding = float(funding_info.get("annualized_rate", 0.0))
+        r_risk_free = float(self.spot_client.get_us_treasury_risk_free_rate())
+
+        df_candles = self.spot_client.get_clean_spot_candles(
+            symbol=f"{self.currency}USDC", interval="1h", limit=168, save_csv=False
+        )
+
+        rv_7d = VolatilityEngine.garman_klass(df_candles) if not df_candles.empty else 0.60
+        bv_7d = VolatilityEngine.jump_robust_bipower_variation(df_candles) if not df_candles.empty else 0.60
+        rolling_rv = VolatilityEngine.rolling_garman_klass(df_candles, window=24) if not df_candles.empty else pd.Series()
+        rv_24h = float(rolling_rv.iloc[-1]) if len(rolling_rv) > 0 else rv_7d
+
+        regime_data = VolatilityEngine.classify_volatility_regime(rolling_rv, current_rv=rv_24h)
+
+        return {
+            "spot_price": spot_price,
+            "r_risk_free": r_risk_free,
+            "q_funding": q_funding,
+            "rv_24h": rv_24h,
+            "rv_7d": rv_7d,
+            "bv_7d": bv_7d,
+            "regime": regime_data["regime"],
+            "regime_q25": regime_data["q25"],
+            "regime_median": regime_data["median"],
+            "regime_q75": regime_data["q75"]
+        }
+
+    def _extract_leg_price(self, leg: Dict[str, Any], is_buy: bool) -> float:
+        """
+        Rygorystyczna weryfikacja plynnosci arkusza bez podstawiania cen widmowych.
+        Kupno (BUY) wymaga realnego ask > 0.
+        Sprzedaz (SELL) wymaga realnego bid > 0.
+        Enforcowany filtr szerokosci spreadu Bid-Ask.
+        """
+        bid = leg.get("bid")
+        ask = leg.get("ask")
+
+        bid_f = float(bid) if (bid is not None and not pd.isna(bid) and float(bid) > 0.0) else 0.0
+        ask_f = float(ask) if (ask is not None and not pd.isna(ask) and float(ask) > 0.0) else 0.0
+
+        if is_buy:
+            if ask_f <= 0.0:
+                return 0.0
+            if bid_f > 0.0 and ask_f >= bid_f:
+                spread_pct = (ask_f - bid_f) / ask_f
+                if spread_pct > self.max_bid_ask_spread_pct:
+                    return 0.0
+            return ask_f
+        else:
+            if bid_f <= 0.0:
+                return 0.0
+            if ask_f > 0.0 and ask_f >= bid_f:
+                spread_pct = (ask_f - bid_f) / ask_f
+                if spread_pct > self.max_bid_ask_spread_pct:
+                    return 0.0
+            return bid_f
+
+    def generate_all_directional_spreads(
+        self,
+        df_deribit: pd.DataFrame,
+        market_state: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        candidates = []
+        spot = market_state.get("spot_price")
+        if spot is None or spot <= 0.0:
+            return []
+
+        r = market_state["r_risk_free"]
+        q = market_state["q_funding"]
+
+        lower_strike_bound = spot * (1.0 - self.spot_band_pct)
+        upper_strike_bound = spot * (1.0 + self.spot_band_pct)
+
+        unique_expiries = df_deribit["expiry_str"].unique()
+
+        for exp in unique_expiries:
+            exp_df = df_deribit[df_deribit["expiry_str"] == exp].copy()
+            if exp_df.empty:
+                continue
+
+            dte = float(exp_df["dte"].iloc[0])
+            T = float(exp_df["T"].iloc[0])
+
+            # 1. BULL CALL SPREADY
+            calls = exp_df[exp_df["option_type"] == "CALL"].sort_values(by="strike").to_dict("records")
+            n_calls = len(calls)
+
+            for i in range(n_calls):
+                long_leg = calls[i]
+                k_long = float(long_leg["strike"])
+                if not (lower_strike_bound <= k_long <= upper_strike_bound):
+                    continue
+
+                p_long = self._extract_leg_price(long_leg, is_buy=True)
+                if p_long <= 0.0:
+                    continue
+
+                for j in range(i + 1, n_calls):
+                    short_leg = calls[j]
+                    k_short = float(short_leg["strike"])
+                    if k_short > upper_strike_bound:
+                        continue
+
+                    width = k_short - k_long
+                    if not (self.min_wing_width <= width <= self.max_wing_width):
+                        continue
+
+                    p_short = self._extract_leg_price(short_leg, is_buy=False)
+                    if p_short <= 0.0:
+                        continue
+
+                    fair_iv_long = float(long_leg.get("iv") or 0.60)
+                    fair_iv_short = float(short_leg.get("iv") or 0.60)
+
+                    legs_structure = [
+                        {
+                            "strike": k_long,
+                            "option_type": "CALL",
+                            "side": "BUY",
+                            "amount": 1.0,
+                            "entry_price": p_long,
+                            "iv": fair_iv_long,
+                            "T": T
+                        },
+                        {
+                            "strike": k_short,
+                            "option_type": "CALL",
+                            "side": "SELL",
+                            "amount": 1.0,
+                            "entry_price": p_short,
+                            "iv": fair_iv_short,
+                            "T": T
+                        }
+                    ]
+
+                    # Zachowanie rynkowego Skew (fair_iv=None)
+                    payoff_res = PayoffEngine.analyze_spread_payoff(
+                        legs=legs_structure, S=spot, T=T, r=r, q=q, fair_iv=None, exchange=self.exchange
+                    )
+
+                    max_win = payoff_res["max_profit_usd"]
+                    cap_risk = payoff_res["capital_at_risk_usd"]
+                    rr_ratio = payoff_res["reward_to_risk_ratio"]
+                    pop_pct = payoff_res["probability_of_profit_pct"]
+
+                    if not isinstance(max_win, (int, float)) or max_win <= 0.0:
+                        continue
+                    if not isinstance(cap_risk, (int, float)) or cap_risk <= 0.0:
+                        continue
+                    if rr_ratio is None or rr_ratio <= 0.0:
+                        continue
+                    if pop_pct < self.min_pop_pct:
+                        continue
+
+                    greeks_res = PortfolioGreeksEngine.aggregate_spread_greeks(
+                        legs=legs_structure, S=spot, T=T, r=r, q=q
+                    )
+
+                    candidates.append({
+                        "STRATEGY": "BULL_CALL",
+                        "STRAT": "BULL_CALL",
+                        "EXPIRY": exp,
+                        "DTE": round(dte, 1),
+                        "LONG_K": k_long,
+                        "SHORT_K": k_short,
+                        "WIDTH": round(width, 1),
+                        "NET_COST": round(payoff_res["net_entry_cost_usd"], 2),
+                        "CAP_RISK": round(cap_risk, 2),
+                        "MAX_WIN": round(max_win, 2),
+                        "RR_RATIO": round(rr_ratio, 2),
+                        "BREAKEVEN": round(payoff_res["breakeven_points"][0], 2) if payoff_res["breakeven_points"] else None,
+                        "POP_PCT": round(pop_pct, 1),
+                        "EV_USD": round(payoff_res.get("expected_value_usd", 0.0), 2),
+                        "EXP_ROI_PCT": round(payoff_res.get("expected_roi_pct", 0.0), 1) if payoff_res.get("expected_roi_pct") is not None else None,
+                        "NET_DELTA": round(greeks_res["net_delta"], 3),
+                        "NET_THETA": round(greeks_res["net_theta_daily"], 3),
+                        "AVG_IV": round((fair_iv_long + fair_iv_short) / 2.0, 4)
+                    })
+
+            # 2. BEAR PUT SPREADY
+            puts = exp_df[exp_df["option_type"] == "PUT"].sort_values(by="strike").to_dict("records")
+            n_puts = len(puts)
+
+            for i in range(n_puts):
+                # Noga krotka: nizszy strike sprzedawany
+                short_leg_p = puts[i]
+                k_short_p = float(short_leg_p["strike"])
+                if not (lower_strike_bound <= k_short_p <= upper_strike_bound):
+                    continue
+
+                p_short_p = self._extract_leg_price(short_leg_p, is_buy=False)
+                if p_short_p <= 0.0:
+                    continue
+
+                for j in range(i + 1, n_puts):
+                    # Noga dluga: wyzszy strike kupowany
+                    long_leg_p = puts[j]
+                    k_long_p = float(long_leg_p["strike"])
+                    if k_long_p > upper_strike_bound:
+                        continue
+
+                    width_p = k_long_p - k_short_p
+                    if not (self.min_wing_width <= width_p <= self.max_wing_width):
+                        continue
+
+                    p_long_p = self._extract_leg_price(long_leg_p, is_buy=True)
+                    if p_long_p <= 0.0:
+                        continue
+
+                    fair_iv_long_p = float(long_leg_p.get("iv") or 0.60)
+                    fair_iv_short_p = float(short_leg_p.get("iv") or 0.60)
+
+                    legs_structure_p = [
+                        {
+                            "strike": k_long_p,
+                            "option_type": "PUT",
+                            "side": "BUY",
+                            "amount": 1.0,
+                            "entry_price": p_long_p,
+                            "iv": fair_iv_long_p,
+                            "T": T
+                        },
+                        {
+                            "strike": k_short_p,
+                            "option_type": "PUT",
+                            "side": "SELL",
+                            "amount": 1.0,
+                            "entry_price": p_short_p,
+                            "iv": fair_iv_short_p,
+                            "T": T
+                        }
+                    ]
+
+                    # Zachowanie rynkowego Skew (fair_iv=None)
+                    payoff_res_p = PayoffEngine.analyze_spread_payoff(
+                        legs=legs_structure_p, S=spot, T=T, r=r, q=q, fair_iv=None, exchange=self.exchange
+                    )
+
+                    max_win_p = payoff_res_p["max_profit_usd"]
+                    cap_risk_p = payoff_res_p["capital_at_risk_usd"]
+                    rr_ratio_p = payoff_res_p["reward_to_risk_ratio"]
+                    pop_pct_p = payoff_res_p["probability_of_profit_pct"]
+
+                    if not isinstance(max_win_p, (int, float)) or max_win_p <= 0.0:
+                        continue
+                    if not isinstance(cap_risk_p, (int, float)) or cap_risk_p <= 0.0:
+                        continue
+                    if rr_ratio_p is None or rr_ratio_p <= 0.0:
+                        continue
+                    if pop_pct_p < self.min_pop_pct:
+                        continue
+
+                    greeks_res_p = PortfolioGreeksEngine.aggregate_spread_greeks(
+                        legs=legs_structure_p, S=spot, T=T, r=r, q=q
+                    )
+
+                    candidates.append({
+                        "STRATEGY": "BEAR_PUT",
+                        "STRAT": "BEAR_PUT",
+                        "EXPIRY": exp,
+                        "DTE": round(dte, 1),
+                        "LONG_K": k_long_p,
+                        "SHORT_K": k_short_p,
+                        "WIDTH": round(width_p, 1),
+                        "NET_COST": round(payoff_res_p["net_entry_cost_usd"], 2),
+                        "CAP_RISK": round(cap_risk_p, 2),
+                        "MAX_WIN": round(max_win_p, 2),
+                        "RR_RATIO": round(rr_ratio_p, 2),
+                        "BREAKEVEN": round(payoff_res_p["breakeven_points"][0], 2) if payoff_res_p["breakeven_points"] else None,
+                        "POP_PCT": round(pop_pct, 1),
+                        "EV_USD": round(payoff_res_p.get("expected_value_usd", 0.0), 2),
+                        "EXP_ROI_PCT": round(payoff_res_p.get("expected_roi_pct", 0.0), 1) if payoff_res_p.get("expected_roi_pct") is not None else None,
+                        "NET_DELTA": round(greeks_res_p["net_delta"], 3),
+                        "NET_THETA": round(greeks_res_p["net_theta_daily"], 3),
+                        "AVG_IV": round((fair_iv_long_p + fair_iv_short_p) / 2.0, 4)
+                    })
+
+        return candidates
+
+    def run_screener(
+        self,
+        output_csv_filename: str = "deribit_sol_spreads.csv",
+        top_n_per_strategy: int = 10
+    ) -> Tuple[Dict[str, Any], pd.DataFrame, pd.DataFrame]:
+        market_state = self.fetch_live_market_state()
+        spot = market_state.get("spot_price")
+        if spot is None or spot <= 0.0:
+            print("[BLAD] Brak poprawnego kursu spot z Deribit.")
+            return market_state, pd.DataFrame(), pd.DataFrame()
+
+        df_deribit = self.deribit_client.get_clean_options_chain(
+            underlying=self.currency, min_dte=self.min_dte, max_dte=self.max_dte
+        )
+
+        if df_deribit.empty:
+            print(f"[INFO] Brak opcji na Deribit w oknie DTE ({self.min_dte} - {self.max_dte} dni).")
+            return market_state, pd.DataFrame(), pd.DataFrame()
+
+        raw_candidates = self.generate_all_directional_spreads(
+            df_deribit=df_deribit, market_state=market_state
+        )
+
+        if not raw_candidates:
+            print("[INFO] Brak spreadow spelniajacych kryteria na Deribit.")
+            return market_state, pd.DataFrame(), pd.DataFrame()
+
+        df_all = pd.DataFrame(raw_candidates)
+
+        # Zapis pelnej bazy do pliku CSV
+        output_dir = os.path.abspath(os.path.join(PROJECT_ROOT, "data"))
+        os.makedirs(output_dir, exist_ok=True)
+        csv_path = os.path.join(output_dir, output_csv_filename)
+        df_all.to_csv(csv_path, index=False)
+        print(f"\n[OK] Zapisano pelna baze ({len(df_all)} spreadow z Deribit) do:")
+        print(f"     -> {csv_path}\n")
+
+        # Rozdzielenie na Top 10 Bull Call oraz Top 10 Bear Put posortowane po R/R
+        df_bull_call = df_all[df_all["STRATEGY"] == "BULL_CALL"].sort_values(
+            by=["RR_RATIO", "POP_PCT"], ascending=[False, False]
+        ).head(top_n_per_strategy).reset_index(drop=True)
+
+        df_bear_put = df_all[df_all["STRATEGY"] == "BEAR_PUT"].sort_values(
+            by=["RR_RATIO", "POP_PCT"], ascending=[False, False]
+        ).head(top_n_per_strategy).reset_index(drop=True)
+
+        return market_state, df_bull_call, df_bear_put
+
+    @staticmethod
+    def _format_dataframe_view(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return pd.DataFrame()
+        return pd.DataFrame({
+            "STRAT": df["STRATEGY"],
+            "EXPIRY": df["EXPIRY"],
+            "DTE": df["DTE"].map("{:.1f}d".format),
+            "LONG_K": df["LONG_K"].map("{:.0f} USD".format),
+            "SHORT_K": df["SHORT_K"].map("{:.0f} USD".format),
+            "WIDTH": df["WIDTH"].map("{:.0f} USD".format),
+            "COST": df["NET_COST"].map("{:+.2f} USD".format),
+            "RISK": df["CAP_RISK"].map("{:.2f} USD".format),
+            "MAX_WIN": df["MAX_WIN"].map("{:.2f} USD".format),
+            "R/R": df["RR_RATIO"].map("{:.2f}".format),
+            "BREAKEVEN": df["BREAKEVEN"].apply(lambda x: f"{x:.2f} USD" if x is not None else "N/A"),
+            "POP": df["POP_PCT"].map("{:.1f}%".format),
+            "EV": df["EV_USD"].map("{:+.2f} USD".format),
+            "EXP_ROI": df["EXP_ROI_PCT"].apply(lambda x: f"{x:+.1f}%" if (x is not None and not pd.isna(x)) else "N/A"),
+            "DELTA": df["NET_DELTA"].map("{:+.3f}".format),
+            "THETA": df["NET_THETA"].map("{:+.3f}".format)
+        })
+
+    @classmethod
+    def display_dashboard(
+        cls,
+        market_state: Dict[str, Any],
+        df_bull_call: pd.DataFrame,
+        df_bear_put: pd.DataFrame
+    ):
+        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        spot = market_state.get("spot_price", 0.0)
+
+        print("========================================================================================================================")
+        print(f"                         DERIBIT OFFICIAL SPREAD SCREENER (SOL) - {now_utc}")
+        print("========================================================================================================================")
+        print(f"Spot SOL:           {spot:.2f} USD")
+        print(f"Risk-Free Rate (r): {market_state['r_risk_free'] * 100:.2f}% | Funding Carry (q): {market_state['q_funding'] * 100:.4f}% APR")
+        print(f"Realized Vol (RV):  24h = {market_state['rv_24h'] * 100:.2f}% | 7d GK = {market_state['rv_7d'] * 100:.2f}%")
+        print("========================================================================================================================")
+
+        # TABELA 1: BULL CALL SPREADS
+        print("\n>>> DERIBIT: TOP 10 BULL CALL SPREADOW (STRATEGIE BYCZE / NA WZROST) - RANKING WG R/R <<<")
+        view_call = cls._format_dataframe_view(df_bull_call)
+        if view_call.empty:
+            print("[INFO] Brak konfiguracji Bull Call spelniajacych kryteria na Deribit.")
+        else:
+            if HAS_TABULATE:
+                print(tabulate(view_call, headers="keys", tablefmt="fancy_grid", showindex=True))
+            else:
+                pd.set_option("display.max_columns", None)
+                pd.set_option("display.width", 1000)
+                print(view_call.to_string(index=True))
+
+        # TABELA 2: BEAR PUT SPREADS
+        print("\n>>> DERIBIT: TOP 10 BEAR PUT SPREADOW (STRATEGIE NIEDZWIEDZIE / NA SPADEK) - RANKING WG R/R <<<")
+        view_put = cls._format_dataframe_view(df_bear_put)
+        if view_put.empty:
+            print("[INFO] Brak konfiguracji Bear Put spelniajacych kryteria na Deribit.")
+        else:
+            if HAS_TABULATE:
+                print(tabulate(view_put, headers="keys", tablefmt="fancy_grid", showindex=True))
+            else:
+                pd.set_option("display.max_columns", None)
+                pd.set_option("display.width", 1000)
+                print(view_put.to_string(index=True))
+
+        print("\n========================================================================================================================")
+
+
+if __name__ == "__main__":
+    # Zakres DTE 18 - 40 dni, pasmo +/- 20% od Spotu, realne skrzydla 4-25 USD, PoP >= 38%
+    screener = SpreadScreener(
+        currency="SOL",
+        min_dte=18.0,
+        max_dte=40.0,
+        spot_band_pct=0.20,
+        min_wing_width=4.0,
+        max_wing_width=25.0,
+        min_pop_pct=38.0,
+        max_bid_ask_spread_pct=0.25
+    )
+
+    state, top_bull_calls, top_bear_puts = screener.run_screener(
+        output_csv_filename="deribit_sol_spreads.csv",
+        top_n_per_strategy=10
+    )
+    SpreadScreener.display_dashboard(state, top_bull_calls, top_bear_puts)
+
+    # =========================================================================
+    # INTERAKTYWNA PETLA PIPELINE'U PROJEKCJI
+    # =========================================================================
+    spot_val = state.get("spot_price", 120.0)
+    drift_val = state["r_risk_free"] - state["q_funding"]
+
+    while True:
+        try:
+            cmd = input("\nWpisz pozycje do projekcji (np. 'bull 0', 'bear 6', lub 'q' aby zakonczyc): ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print("\nZamknieto sesje.")
+            break
+
+        if cmd in ("q", "quit", "exit"):
+            print("Zakonczenie pracy skanera.")
+            break
+
+        parts = cmd.split()
+        if len(parts) != 2 or parts[0] not in ("bull", "bear") or not parts[1].isdigit():
+            print("[BLAD] Niepoprawny format. Wpisz np. 'bull 0' albo 'bear 2'.")
+            continue
+
+        strat_type = parts[0]
+        idx = int(parts[1])
+
+        target_df = top_bull_calls if strat_type == "bull" else top_bear_puts
+
+        if idx >= len(target_df) or idx < 0:
+            print(f"[BLAD] Indeks poza zakresem. Dostepe indeksy: od 0 do {len(target_df) - 1}.")
+            continue
+
+        selected_row = target_df.iloc[idx].to_dict()
+        iv_val = float(selected_row.get("AVG_IV") or 0.60)
+
+        # Wywolanie silnika projekcji cenowej i szansy dotkniecia
+        PriceProjectionEngine.display_projection_report(
+            spot=spot_val,
+            volatility=iv_val,
+            drift=drift_val,
+            strategy_row=selected_row
+        )
+
+
+==================================================
+PLIK: \src\strategies\__init__.py
+==================================================
+
+
+==================================================
+PLIK: \src\tests\test_black_scholes.py
+==================================================
+
+
+==================================================
+PLIK: \src\tests\test_volatility.py
+==================================================
+
+
