@@ -16,20 +16,20 @@ from src.quant.greeks import PortfolioGreeksEngine
 
 class PayoffEngine:
     """
-    Rygorystyczny silnik analityczny profilu wypłaty, kalkulacji punktów przełamania (Breakeven),
-    metryk asymetrii ryzyka do zysku (Risk/Reward), prawdopodobieństwa zysku (PoP) oraz
-    wartości oczekiwanej (EV) dla jedno- i wielonogowych struktur opcyjnych na giełdach Derive i Deribit.
-    W pełni zachowuje strukturę uśmiechu zmienności (Volatility Skew) dla każdej nogi portfela.
+    Rygorystyczny silnik analityczny profilu wyplaty, kalkulacji punktow przelamania (Breakeven),
+    metryk asymetrii ryzyka do zysku (Risk/Reward), prawdopodobienstwa zysku (PoP),
+    wyceny martyngalowej w mierze Q oraz rzeczywistej przewagi statystycznej (Edge) w mierze P.
+    W pelni zachowuje strukture usmiechu zmiennosci (Volatility Skew) dla kazdej nogi portfela.
     """
 
     DAYS_PER_YEAR: float = 365.0
 
-    # Domyślne parametry prowizji giełdowych (stan na 2026 r.)
-    # Derive: ~15 bps od wartości bazowej, z limitem max 25% wartości premii
+    # Domyslne parametry prowizji gieldowych (stan na 2026 r.)
+    # Derive: ~15 bps od wartosci bazowej, z limitem max 25% wartosci premii
     DERIVE_TAKER_FEE_BPS: float = 0.0015
     DERIVE_FEE_CAP_PCT: float = 0.25
 
-    # Deribit: ~3 bps od wartości bazowej, z limitem max 12.5% wartości premii
+    # Deribit: ~3 bps od wartosci bazowej, z limitem max 12.5% wartosci premii
     DERIBIT_TAKER_FEE_BPS: float = 0.0003
     DERIBIT_FEE_CAP_PCT: float = 0.125
 
@@ -44,8 +44,8 @@ class PayoffEngine:
         fee_cap_pct: Optional[float] = None
     ) -> float:
         """
-        Oblicza prowizję transakcyjną z uwzględnieniem limitu procentowego (fee cap).
-        Gwarantuje brak aberracji: dla premium <= 0 prowizja wynosi bezwzględnie 0.0 USD.
+        Oblicza prowizje transakcyjna z uwzglednieniem limitu procentowego (fee cap).
+        Gwarantuje brak aberracji: dla premium <= 0 prowizja wynosi bezwzglednie 0.0 USD.
         """
         ex = exchange.lower()
         if fee_bps is not None and fee_cap_pct is not None:
@@ -72,8 +72,8 @@ class PayoffEngine:
         net_cost: float = 0.0
     ) -> Union[float, np.ndarray]:
         """
-        Oblicza czysty PnL terminalny w momencie wygaśnięcia (T = 0) dla podanego kursu lub wektora kursów S_T.
-        PnL = Wypłata_brutto - Koszt_netto
+        Oblicza czysty PnL terminalny w momencie wygasniecia (T = 0) dla podanego kursu lub wektora kursow S_T.
+        PnL = Wyplata_brutto - Koszt_netto
         """
         is_array = isinstance(S_T, np.ndarray)
         payoff = np.zeros_like(S_T, dtype=float) if is_array else 0.0
@@ -109,9 +109,8 @@ class PayoffEngine:
         net_cost: float
     ) -> List[float]:
         """
-        Analityczne wyznaczenie wszystkich punktów przełamania (miejsc zerowych PnL).
-        Działa bez heurystyk numerycznych: bada odcinki wewnętrzne [0, K_1], ..., [K_{n-1}, K_n]
-        oraz wyznacza pierwiastek analityczny na prawej półprostej [K_n, infinity).
+        Analityczne wyznaczenie wszystkich punktow przelamania (miejsc zerowych PnL).
+        Dziala bez heurystyk numerycznych na odcinkach wewnetrznych i prawej polprostej.
         """
         strikes = sorted(list({float(leg["strike"]) for leg in legs if "strike" in leg}))
         if not strikes:
@@ -119,7 +118,7 @@ class PayoffEngine:
 
         breakevens = []
 
-        # 1. Punkty węzłowe dla odcinków wewnętrznych
+        # 1. Punkty wezlowe dla odcinkow wewnetrznych
         nodes = [0.0] + strikes
         for i in range(len(nodes) - 1):
             s_left = nodes[i]
@@ -137,13 +136,13 @@ class PayoffEngine:
                     if s_left <= root <= s_right:
                         breakevens.append(round(root, 4))
 
-        # Węzeł końcowy K_max
+        # Wezel koncowy K_max
         max_k = strikes[-1]
         pnl_max_k = float(cls.evaluate_terminal_payoff(legs, max_k, net_cost))
         if abs(pnl_max_k) < 1e-9:
             breakevens.append(round(max_k, 4))
 
-        # 2. Prawa półprosta [K_max, infinity): analityczne nachylenie
+        # 2. Prawa polprosta [K_max, infinity): analityczne nachylenie
         slope_inf = 0.0
         for leg in legs:
             opt_type = str(leg.get("option_type", "CALL")).upper()
@@ -177,8 +176,8 @@ class PayoffEngine:
         sigma: float
     ) -> float:
         """
-        Ścisłe wyliczenie Prawdopodobieństwa Zysku (Probability of Profit – PoP).
-        Całkuje analitycznie rozkład log-normalny forwardu P(S_T in Zysk).
+        Scisle wyliczenie Prawdopodobienstwa Zysku (Probability of Profit - PoP).
+        Calkuje analitycznie rozklad log-normalny forwardu P(S_T in Zysk).
         """
         if T <= 1e-7 or sigma <= 1e-4 or S <= 0.0:
             pnl_now = cls.evaluate_terminal_payoff(legs, S, net_cost)
@@ -191,7 +190,7 @@ class PayoffEngine:
             if x <= 0.0:
                 return 0.0
             d2 = (math.log(forward / x) - 0.5 * (sigma ** 2.0) * T) / std_dev
-            return float(norm.cdf(-d2))  # P(S_T <= x)
+            return float(norm.cdf(-d2))
 
         if not breakevens:
             sample_pnl = cls.evaluate_terminal_payoff(legs, S, net_cost)
@@ -226,33 +225,30 @@ class PayoffEngine:
         r: float,
         q: float,
         fair_iv: Optional[float] = None,
+        forecast_rv: Optional[float] = None,
         net_cost: float = 0.0,
         capital_at_risk: Optional[float] = None
     ) -> Dict[str, Any]:
         """
-        Wyznacza wartość oczekiwaną wypłaty i przewagę statystyczną (EV Edge).
-        Zgodnie z wyceną martyngałową w walucie rozliczeniowej (USDC):
-        E[Gross_Payout] = V_0 * exp(r * T)
-        Wycenia każdą nogę według jej indywidualnego IV (Volatility Skew),
-        zabezpieczając przed spłaszczaniem struktury uśmiechu zmienności.
+        Prawidlowe rozdzielenie wyceny martyngalowej w mierze Q od statystycznego Edge w mierze P.
+        Jesli podano forecast_rv, wycenia kontrakt wedlug prognozy fizycznej zmiennosci,
+        porownujac ja z rynkowym kosztem wejscia (statistical_edge_usd).
         """
         if T <= 1e-7:
             pnl_terminal = cls.evaluate_terminal_payoff(legs, S, net_cost)
-            car = capital_at_risk if (capital_at_risk is not None and capital_at_risk > 0.0) else (
-                net_cost if net_cost > 0.0 else abs(pnl_terminal)
-            )
+            car = capital_at_risk if (capital_at_risk is not None and capital_at_risk > 0.0) else max(abs(net_cost), 1.0)
             roi = round(float(pnl_terminal / car * 100.0), 2) if car > 0.0 else 0.0
             return {
                 "fair_portfolio_pv_usd": round(float(pnl_terminal + net_cost), 4),
                 "expected_gross_payout_usd": round(float(pnl_terminal + net_cost), 4),
                 "expected_net_ev_usd": round(float(pnl_terminal), 4),
+                "statistical_edge_usd": 0.0,
                 "capital_at_risk_usd": round(float(car), 4),
                 "expected_roi_pct": roi
             }
 
-        # Gotówka USDC akumuluje się wyłącznie stopą wolną od ryzyka r
         compounding_factor = math.exp(r * T)
-        fair_portfolio_pv = 0.0
+        physical_fair_pv = 0.0
 
         for leg in legs:
             K = float(leg.get("strike", S))
@@ -261,19 +257,23 @@ class PayoffEngine:
             amount = float(leg.get("amount", 1.0))
             weight = PortfolioGreeksEngine.parse_leg_weight(side, amount)
 
-            # ŚCISŁE ZACHOWANIE SKEW: Priorytet dla indywidualnego IV nogi
-            leg_iv = float(leg.get("iv") or fair_iv or 0.60)
+            # Wybor zmiennosci: priorytet dla prognozy fizycznej RV (miara P), nastepnie dedykowany IV nogi
+            if forecast_rv is not None and forecast_rv > 0.0:
+                eval_vol = forecast_rv
+            else:
+                eval_vol = float(leg.get("iv") or fair_iv or 0.60)
 
             model_price = BlackScholesEngine.price(
-                S=S, K=K, T=T, r=r, sigma=leg_iv, q=q, option_type=opt_type
+                S=S, K=K, T=T, r=r, sigma=eval_vol, q=q, option_type=opt_type
             )
-            fair_portfolio_pv += weight * model_price
+            physical_fair_pv += weight * model_price
 
-        # Wartość oczekiwana wypłaty terminalnej
-        expected_gross_payout = fair_portfolio_pv * compounding_factor
+        # Wyplata brutto na wygasnieciu akumulowana stopa wolna od ryzyka r
+        expected_gross_payout = physical_fair_pv * compounding_factor
         expected_net_ev = expected_gross_payout - net_cost
+        statistical_edge = physical_fair_pv - net_cost
 
-        # Obliczenie kapitału narażonego na ryzyko (Capital at Risk / Depozyt)
+        # Wyznaczenie bazy kapitalu narazonego na ryzyko
         if capital_at_risk is not None and capital_at_risk > 0.0:
             car = capital_at_risk
         elif net_cost > 0.0:
@@ -284,9 +284,10 @@ class PayoffEngine:
         expected_roi = round(float(expected_net_ev / car * 100.0), 2) if car > 0.0 else 0.0
 
         return {
-            "fair_portfolio_pv_usd": round(fair_portfolio_pv, 4),
+            "fair_portfolio_pv_usd": round(physical_fair_pv, 4),
             "expected_gross_payout_usd": round(expected_gross_payout, 4),
             "expected_net_ev_usd": round(expected_net_ev, 4),
+            "statistical_edge_usd": round(statistical_edge, 4),
             "capital_at_risk_usd": round(car, 4),
             "expected_roi_pct": expected_roi
         }
@@ -300,17 +301,18 @@ class PayoffEngine:
         r: float = 0.05,
         q: float = 0.0,
         fair_iv: Optional[float] = None,
+        forecast_rv: Optional[float] = None,
         exchange: str = "derive",
         custom_fee_per_leg: Optional[float] = None
     ) -> Dict[str, Any]:
         """
-        Główna metoda analityczna. Dokonuje całościowej oceny opłacalności:
-        Max Profit, Max Loss, Capital at Risk, R/R, Breakevens, PoP, EV oraz koszty transakcyjne.
+        Glowna metoda analityczna. Dokonuje calosciowej oceny oplacalnosci:
+        Max Profit, Max Loss, Capital at Risk, R/R, Breakevens, PoP, EV, Statistical Edge oraz prowizje.
         """
         if not legs or S <= 0.0:
-            return {"error": "Błędne parametry wejściowe lub brak nóg spreadu."}
+            return {"error": "Bledne parametry wejsciowe lub brak nog spreadu."}
 
-        # 1. Rozliczenie przepływów pieniężnych (Cash Flow) i prowizji
+        # 1. Rozliczenie przeplywow pienieznych (Cash Flow) i prowizji
         total_premium_paid = 0.0
         total_fees = 0.0
         strikes = []
@@ -349,14 +351,14 @@ class PayoffEngine:
         is_profit_unbounded = slope_at_inf > 1e-7
         is_loss_unbounded = slope_at_inf < -1e-7
 
-        # 3. Badanie ekstremów w punktach osobliwych
+        # 3. Badanie ekstremow w punktach osobliwych
         crit_points = [0.0] + sorted(strikes) + [max(strikes) * 2.0]
         crit_pnls = [cls.evaluate_terminal_payoff(legs, pt, net_entry_cost) for pt in crit_points]
 
         max_profit = float("inf") if is_profit_unbounded else max(crit_pnls)
         max_loss = -float("inf") if is_loss_unbounded else min(crit_pnls)
 
-        # 4. Wyznaczenie kapitału narażonego na ryzyko (Capital at Risk)
+        # 4. Wyznaczenie kapitalu narazonego na ryzyko (Capital at Risk)
         if is_loss_unbounded:
             capital_at_risk = float("inf")
         elif is_debit:
@@ -364,7 +366,7 @@ class PayoffEngine:
         else:
             capital_at_risk = abs(max_loss) if abs(max_loss) > 0.0 else abs(net_entry_cost)
 
-        # 5. Wyznaczenie wskaźników asymetrii Risk / Reward
+        # 5. Wyznaczenie wskaznikow asymetrii Risk / Reward
         if math.isinf(max_profit) or math.isinf(max_loss) or max_profit <= 0.0 or max_loss >= 0.0:
             risk_reward_ratio = None
             reward_to_risk_ratio = None
@@ -377,7 +379,7 @@ class PayoffEngine:
         # 6. Analityczne Breakevens
         breakevens = cls._find_exact_breakevens(legs, net_entry_cost)
 
-        # 7. Prawdopodobieństwo Zysku (PoP)
+        # 7. Prawdopodobienstwo Zysku (PoP)
         ref_iv = fair_iv if fair_iv is not None else float(legs[0].get("iv") or 0.60)
         pop = cls.calculate_pop(
             legs=legs,
@@ -390,7 +392,7 @@ class PayoffEngine:
             sigma=ref_iv
         )
 
-        # 8. Wartość Oczekiwana (EV) z zachowaniem pełnego Skew (fair_iv przekazywane wprost)
+        # 8. Wartosc Oczekiwana (EV) oraz Przewaga Statystyczna (Edge)
         ev_metrics = cls.calculate_expected_value(
             legs=legs,
             S=S,
@@ -398,6 +400,7 @@ class PayoffEngine:
             r=r,
             q=q,
             fair_iv=fair_iv,
+            forecast_rv=forecast_rv,
             net_cost=net_entry_cost,
             capital_at_risk=capital_at_risk if not math.isinf(capital_at_risk) else None
         )
@@ -417,8 +420,10 @@ class PayoffEngine:
             "breakeven_points": breakevens,
             "probability_of_profit_pct": round(pop * 100.0, 2),
             "expected_value_usd": ev_metrics["expected_net_ev_usd"],
+            "statistical_edge_usd": ev_metrics["statistical_edge_usd"],
             "expected_roi_pct": ev_metrics["expected_roi_pct"] if not math.isinf(capital_at_risk) else None,
-            "is_ev_positive": ev_metrics["expected_net_ev_usd"] > 0.0
+            "is_ev_positive": ev_metrics["expected_net_ev_usd"] > 0.0,
+            "is_edge_positive": ev_metrics["statistical_edge_usd"] > 0.0
         }
 
     @classmethod
@@ -432,7 +437,7 @@ class PayoffEngine:
         num_points: int = 250
     ) -> pd.DataFrame:
         """
-        Generuje nieliniową, gęstą wektorową siatkę profilu PnL w całym spektrum cenowym.
+        Generuje nieliniowa, gesta wektorowa siatke profilu PnL w calym spektrum cenowym.
         """
         if net_cost is None:
             net_cost = sum(

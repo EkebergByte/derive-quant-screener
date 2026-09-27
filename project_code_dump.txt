@@ -2157,7 +2157,8 @@ class PriceProjectionEngine:
     Rygorystyczny silnik projekcji prawdopodobienstwa i stozkow cenowych.
     Wylicza przedzialy ufnosci w czasie oraz analityczne prawdopodobienstwo
     dotkniecia poziomow docelowych (First-Passage Time / Probability of Touching).
-    W pelni uwzglednia korekte Ito dla geometrycznego ruchu Browna (GBM).
+    W pelni uwzglednia korekte Ito dla geometrycznego ruchu Browna (GBM)
+    oraz obsluguje warunki brzegowe dla pozycji juz znajdujacych sie w zysku (ITM).
     """
 
     DAYS_PER_YEAR: float = 365.0
@@ -2308,8 +2309,8 @@ class PriceProjectionEngine:
         strategy_row: Dict[str, Any]
     ) -> pd.DataFrame:
         """
-        Wylicza matryce celow dla wybranego spreadu z pelna normalizacja kontraktu
-        i wlasciwym kierunkiem dla strategii byczych i niedzwiedzich.
+        Wylicza matryce celow dla wybranego spreadu z pelna normalizacja kontraktu,
+        wlasciwym kierunkiem oraz obsluga pozycji juz znajdujacych sie w zysku (ITM).
         """
         t_total = dte_days / cls.DAYS_PER_YEAR
         
@@ -2362,14 +2363,19 @@ class PriceProjectionEngine:
 
         rows = []
         for desc, p_target in targets:
-            # Prawdopodobienstwo dotkniecia przed wygasnieciem (PoT)
-            pot = cls.calculate_first_passage_touch(
-                spot=spot,
-                barrier=p_target,
-                time_years=t_total,
-                volatility=volatility,
-                drift=drift
-            )
+            # OPTYMALIZACJA: Jesli cel jest juz przekroczony na starcie (ITM), PoT = 1.0 (100%)
+            is_already_reached = (spot >= p_target) if is_bull else (spot <= p_target)
+
+            if is_already_reached:
+                pot = 1.0
+            else:
+                pot = cls.calculate_first_passage_touch(
+                    spot=spot,
+                    barrier=p_target,
+                    time_years=t_total,
+                    volatility=volatility,
+                    drift=drift
+                )
 
             # Prawdopodobienstwo zakonczenia na wygasnieciu za celem (PoE)
             poe = cls.calculate_expiring_beyond(
@@ -2380,6 +2386,9 @@ class PriceProjectionEngine:
                 drift=drift,
                 is_upper=is_bull
             )
+
+            # Spojnosc stochastyczna: PoT nie moze byc mniejszy niz PoE
+            pot = max(pot, poe)
 
             diff_usd = p_target - spot
             diff_pct = (diff_usd / spot) * 100.0
@@ -2879,8 +2888,8 @@ except ImportError:
 class SpreadScreener:
     """
     Skaner ilosciowy opcji SOL oparty w 100 procentach na rynku Deribit.
-    W pelni eliminuje ceny widmowe z arkusza, weryfikuje spread Bid-Ask,
-    wylicza greki, prawdopodobienstwo (PoP), wycene EV oraz stosunek R/R.
+    W pelni eliminuje ceny widmowe z arkusza, wymusza rynek dwustronny,
+    weryfikuje monotonicznosc cenowa oraz relatywny spread Bid-Ask.
     Zintegrowany z interaktywnym silnikiem projekcji prawdopodobienstwa.
     """
 
@@ -2942,9 +2951,10 @@ class SpreadScreener:
     def _extract_leg_price(self, leg: Dict[str, Any], is_buy: bool) -> float:
         """
         Rygorystyczna weryfikacja plynnosci arkusza bez podstawiania cen widmowych.
+        Wymaga pelnego rynku dwustronnego (zarowno Bid > 0, jak i Ask > 0)
+        oraz rygorystycznego spelnienia limitu relatywnego spreadu Bid-Ask.
         Kupno (BUY) wymaga realnego ask > 0.
         Sprzedaz (SELL) wymaga realnego bid > 0.
-        Enforcowany filtr szerokosci spreadu Bid-Ask.
         """
         bid = leg.get("bid")
         ask = leg.get("ask")
@@ -2952,22 +2962,20 @@ class SpreadScreener:
         bid_f = float(bid) if (bid is not None and not pd.isna(bid) and float(bid) > 0.0) else 0.0
         ask_f = float(ask) if (ask is not None and not pd.isna(ask) and float(ask) > 0.0) else 0.0
 
-        if is_buy:
-            if ask_f <= 0.0:
-                return 0.0
-            if bid_f > 0.0 and ask_f >= bid_f:
-                spread_pct = (ask_f - bid_f) / ask_f
-                if spread_pct > self.max_bid_ask_spread_pct:
-                    return 0.0
-            return ask_f
-        else:
-            if bid_f <= 0.0:
-                return 0.0
-            if ask_f > 0.0 and ask_f >= bid_f:
-                spread_pct = (ask_f - bid_f) / ask_f
-                if spread_pct > self.max_bid_ask_spread_pct:
-                    return 0.0
-            return bid_f
+        # KRYTYCZNE ZABEZPIECZENIE: Odrzucenie rynkow jednostronnych (brak bida lub brak aska)
+        if bid_f <= 0.0 or ask_f <= 0.0:
+            return 0.0
+
+        # Zabezpieczenie przed skrzyzowanym arkuszem (Crossed Book / Stale Quote)
+        if ask_f < bid_f:
+            return 0.0
+
+        # Enforcowany filtr szerokosci spreadu wzgledem ceny Ask
+        spread_pct = (ask_f - bid_f) / ask_f
+        if spread_pct > self.max_bid_ask_spread_pct:
+            return 0.0
+
+        return ask_f if is_buy else bid_f
 
     def generate_all_directional_spreads(
         self,
@@ -3023,6 +3031,10 @@ class SpreadScreener:
                     if p_short <= 0.0:
                         continue
 
+                    # KRYTYCZNE: Monotonicznosc cenowa opcji Call (C(K1) > C(K2) dla K1 < K2)
+                    if p_long <= p_short:
+                        continue
+
                     fair_iv_long = float(long_leg.get("iv") or 0.60)
                     fair_iv_short = float(short_leg.get("iv") or 0.60)
 
@@ -3047,7 +3059,6 @@ class SpreadScreener:
                         }
                     ]
 
-                    # Zachowanie rynkowego Skew (fair_iv=None)
                     payoff_res = PayoffEngine.analyze_spread_payoff(
                         legs=legs_structure, S=spot, T=T, r=r, q=q, fair_iv=None, exchange=self.exchange
                     )
@@ -3121,6 +3132,10 @@ class SpreadScreener:
                     if p_long_p <= 0.0:
                         continue
 
+                    # KRYTYCZNE: Monotonicznosc cenowa opcji Put (P(K2) > P(K1) dla K2 > K1)
+                    if p_long_p <= p_short_p:
+                        continue
+
                     fair_iv_long_p = float(long_leg_p.get("iv") or 0.60)
                     fair_iv_short_p = float(short_leg_p.get("iv") or 0.60)
 
@@ -3145,7 +3160,6 @@ class SpreadScreener:
                         }
                     ]
 
-                    # Zachowanie rynkowego Skew (fair_iv=None)
                     payoff_res_p = PayoffEngine.analyze_spread_payoff(
                         legs=legs_structure_p, S=spot, T=T, r=r, q=q, fair_iv=None, exchange=self.exchange
                     )

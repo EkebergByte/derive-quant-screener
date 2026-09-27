@@ -30,6 +30,7 @@ class SpreadScreener:
     Skaner ilosciowy opcji SOL oparty w 100 procentach na rynku Deribit.
     W pelni eliminuje ceny widmowe z arkusza, wymusza rynek dwustronny,
     weryfikuje monotonicznosc cenowa oraz relatywny spread Bid-Ask.
+    Prawidlowo rozdziela koszt carry SOL (staking yield) od sentymentu perp funding.
     Zintegrowany z interaktywnym silnikiem projekcji prawdopodobienstwa.
     """
 
@@ -60,9 +61,13 @@ class SpreadScreener:
     def fetch_live_market_state(self) -> Dict[str, Any]:
         spot_price = self.deribit_client.get_spot_price(self.currency)
 
-        funding_info = self.spot_client.get_current_funding_rate(f"{self.currency}USDT")
-        q_funding = float(funding_info.get("annualized_rate", 0.0))
+        # Rzeczywisty koszt carry dla opcji indeksowych SOL rozliczanych do spotu (Staking Yield netto)
+        q_sol_carry = float(os.getenv("SOL_STAKING_YIELD", "0.068"))
         r_risk_free = float(self.spot_client.get_us_treasury_risk_free_rate())
+
+        # Funding rate z rynku perp pobieramy wylacznie jako indykator sentymentu
+        funding_info = self.spot_client.get_current_funding_rate(f"{self.currency}USDT")
+        perp_funding_apr = float(funding_info.get("annualized_rate", 0.0))
 
         df_candles = self.spot_client.get_clean_spot_candles(
             symbol=f"{self.currency}USDC", interval="1h", limit=168, save_csv=False
@@ -78,7 +83,8 @@ class SpreadScreener:
         return {
             "spot_price": spot_price,
             "r_risk_free": r_risk_free,
-            "q_funding": q_funding,
+            "q_carry": q_sol_carry,
+            "perp_funding_apr": perp_funding_apr,
             "rv_24h": rv_24h,
             "rv_7d": rv_7d,
             "bv_7d": bv_7d,
@@ -128,7 +134,7 @@ class SpreadScreener:
             return []
 
         r = market_state["r_risk_free"]
-        q = market_state["q_funding"]
+        q = market_state["q_carry"]
 
         lower_strike_bound = spot * (1.0 - self.spot_band_pct)
         upper_strike_bound = spot * (1.0 + self.spot_band_pct)
@@ -199,6 +205,7 @@ class SpreadScreener:
                         }
                     ]
 
+                    # Wycena z prawidlowym kosztem carry aktywa bazowego
                     payoff_res = PayoffEngine.analyze_spread_payoff(
                         legs=legs_structure, S=spot, T=T, r=r, q=q, fair_iv=None, exchange=self.exchange
                     )
@@ -430,7 +437,8 @@ class SpreadScreener:
         print(f"                         DERIBIT OFFICIAL SPREAD SCREENER (SOL) - {now_utc}")
         print("========================================================================================================================")
         print(f"Spot SOL:           {spot:.2f} USD")
-        print(f"Risk-Free Rate (r): {market_state['r_risk_free'] * 100:.2f}% | Funding Carry (q): {market_state['q_funding'] * 100:.4f}% APR")
+        print(f"Risk-Free Rate (r): {market_state['r_risk_free'] * 100:.2f}% | SOL Carry Yield (q): {market_state['q_carry'] * 100:.2f}%")
+        print(f"Perp Funding APR:   {market_state['perp_funding_apr'] * 100:.4f}% (Wskaznik sentymentu)")
         print(f"Realized Vol (RV):  24h = {market_state['rv_24h'] * 100:.2f}% | 7d GK = {market_state['rv_7d'] * 100:.2f}%")
         print("========================================================================================================================")
 
@@ -464,7 +472,6 @@ class SpreadScreener:
 
 
 if __name__ == "__main__":
-    # Zakres DTE 18 - 40 dni, pasmo +/- 20% od Spotu, realne skrzydla 4-25 USD, PoP >= 38%
     screener = SpreadScreener(
         currency="SOL",
         min_dte=18.0,
@@ -486,7 +493,9 @@ if __name__ == "__main__":
     # INTERAKTYWNA PETLA PIPELINE'U PROJEKCJI
     # =========================================================================
     spot_val = state.get("spot_price", 120.0)
-    drift_val = state["r_risk_free"] - state["q_funding"]
+    
+    # KRYTYCZNA POPRAWKA: W fizycznej projekcji trajektorii spotu dryf wynosi 0.0 (brak wypaczen z rynku perp)
+    drift_val = 0.0
 
     while True:
         try:
