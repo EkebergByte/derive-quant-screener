@@ -477,8 +477,8 @@ class SpreadScreener:
 if __name__ == "__main__":
     screener = SpreadScreener(
         currency="SOL",
-        min_dte=18.0,
-        max_dte=40.0,
+        min_dte=1.0,
+        max_dte=20.0,
         spot_band_pct=0.20,
         min_wing_width=4.0,
         max_wing_width=25.0,
