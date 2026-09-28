@@ -42,7 +42,8 @@ class SpreadScreener:
         spot_band_pct: float = 0.20,
         min_wing_width: float = 4.0,
         max_wing_width: float = 25.0,
-        min_pop_pct: float = 38.0,
+        min_call_pop_pct: float = 38.0,
+        min_put_pop_pct: float = 15.0,
         max_bid_ask_spread_pct: float = 0.25
     ):
         self.currency = currency.upper()
@@ -52,7 +53,8 @@ class SpreadScreener:
         self.spot_band_pct = spot_band_pct
         self.min_wing_width = min_wing_width
         self.max_wing_width = max_wing_width
-        self.min_pop_pct = min_pop_pct
+        self.min_call_pop_pct = min_call_pop_pct
+        self.min_put_pop_pct = min_put_pop_pct
         self.max_bid_ask_spread_pct = max_bid_ask_spread_pct
 
         self.deribit_client = DeribitClient()
@@ -221,7 +223,7 @@ class SpreadScreener:
                         continue
                     if rr_ratio is None or rr_ratio <= 0.0:
                         continue
-                    if pop_pct < self.min_pop_pct:
+                    if pop_pct < self.min_call_pop_pct:
                         continue
 
                     greeks_res = PortfolioGreeksEngine.aggregate_spread_greeks(
@@ -322,7 +324,8 @@ class SpreadScreener:
                         continue
                     if rr_ratio_p is None or rr_ratio_p <= 0.0:
                         continue
-                    if pop_pct_p < self.min_pop_pct:
+                    if pop_pct_p < self.min_put_pop_pct:
+                        
                         continue
 
                     greeks_res_p = PortfolioGreeksEngine.aggregate_spread_greeks(
@@ -479,7 +482,8 @@ if __name__ == "__main__":
         spot_band_pct=0.20,
         min_wing_width=4.0,
         max_wing_width=25.0,
-        min_pop_pct=38.0,
+        min_call_pop_pct=38.0,
+        min_put_pop_pct=38.0,
         max_bid_ask_spread_pct=0.25
     )
 

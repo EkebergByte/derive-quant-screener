@@ -1,7 +1,7 @@
 import os
 import sys
 import math
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
@@ -18,11 +18,26 @@ class PriceProjectionEngine:
     Rygorystyczny silnik projekcji prawdopodobienstwa i stozkow cenowych.
     Wylicza przedzialy ufnosci w czasie oraz analityczne prawdopodobienstwo
     dotkniecia poziomow docelowych (First-Passage Time / Probability of Touching).
-    W pelni uwzglednia korekte Ito dla geometrycznego ruchu Browna (GBM)
+    Dziala w mierze fizycznej P z prawidlowa korekta Ito dla geometrycznego ruchu Browna (GBM)
     oraz obsluguje warunki brzegowe dla pozycji juz znajdujacych sie w zysku (ITM).
     """
 
     DAYS_PER_YEAR: float = 365.0
+
+    @staticmethod
+    def _clean_numeric(val: Any, default: float = 0.0) -> float:
+        """
+        Bezpieczna konwersja do float odporna na napisy typu '118 USD' lub '+7.87 USD'.
+        """
+        if val is None or pd.isna(val):
+            return default
+        if isinstance(val, (int, float)):
+            return float(val)
+        try:
+            cleaned = str(val).replace("USD", "").replace("+", "").replace("%", "").strip()
+            return float(cleaned)
+        except (ValueError, TypeError):
+            return default
 
     @classmethod
     def calculate_first_passage_touch(
@@ -31,7 +46,7 @@ class PriceProjectionEngine:
         barrier: float,
         time_years: float,
         volatility: float,
-        drift: float
+        drift: float = 0.0
     ) -> float:
         """
         Scisle analityczne prawdopodobienstwo dotkniecia bariery cenowej
@@ -53,13 +68,13 @@ class PriceProjectionEngine:
             m = math.log(barrier / spot)
             term1 = norm.cdf((-m + nu * time_years) / denom)
             expo = (2.0 * nu * m) / (volatility ** 2.0)
-            
+
             # Obustronne zabezpieczenie numeryczne
             if abs(expo) > 700.0:
                 term2 = 0.0
             else:
                 term2 = math.exp(expo) * norm.cdf((-m - nu * time_years) / denom)
-                
+
             pot = term1 + term2
             return float(min(1.0, max(0.0, pot)))
 
@@ -68,13 +83,13 @@ class PriceProjectionEngine:
             m = math.log(barrier / spot)  # wartosc ujemna
             term1 = norm.cdf((m - nu * time_years) / denom)
             expo = (2.0 * nu * m) / (volatility ** 2.0)
-            
+
             # Obustronne zabezpieczenie numeryczne
             if abs(expo) > 700.0:
                 term2 = 0.0
             else:
                 term2 = math.exp(expo) * norm.cdf((m + nu * time_years) / denom)
-                
+
             pot = term1 + term2
             return float(min(1.0, max(0.0, pot)))
 
@@ -85,7 +100,7 @@ class PriceProjectionEngine:
         target: float,
         time_years: float,
         volatility: float,
-        drift: float,
+        drift: float = 0.0,
         is_upper: bool = True
     ) -> float:
         """
@@ -110,7 +125,7 @@ class PriceProjectionEngine:
         spot: float,
         dte_days: float,
         volatility: float,
-        drift: float
+        drift: float = 0.0
     ) -> pd.DataFrame:
         """
         Generuje korytarze stozka zmiennosci dla 50%, 68.3% (1-sigma) i 95.4% (2-sigmy)
@@ -127,14 +142,14 @@ class PriceProjectionEngine:
         rows = []
         for days in checkpoints:
             t_yrs = days / cls.DAYS_PER_YEAR
-            
+
             # Srodek rozkladu log-normalnego (mediana) z korekta Ito: -0.5 * sigma^2
             nu = drift - 0.5 * (volatility ** 2.0)
             median_forward = spot * math.exp(nu * t_yrs)
-            
+
             # Wartosc oczekiwana (srednia arytmetyczna forwardu)
             mean_forward = spot * math.exp(drift * t_yrs)
-            
+
             std_dev = volatility * math.sqrt(t_yrs)
 
             # Poziom 50% (Z = 0.67449)
@@ -166,15 +181,18 @@ class PriceProjectionEngine:
         spot: float,
         dte_days: float,
         volatility: float,
-        drift: float,
-        strategy_row: Dict[str, Any]
+        drift: float = 0.0,
+        strategy_row: Dict[str, Any] = None
     ) -> pd.DataFrame:
         """
         Wylicza matryce celow dla wybranego spreadu z pelna normalizacja kontraktu,
         wlasciwym kierunkiem oraz obsluga pozycji juz znajdujacych sie w zysku (ITM).
         """
+        if strategy_row is None:
+            strategy_row = {}
+
         t_total = dte_days / cls.DAYS_PER_YEAR
-        
+
         # 1. Defensywna normalizacja kontraktu strategii
         strat_raw = str(strategy_row.get("STRATEGY") or strategy_row.get("STRAT") or "").strip().upper()
         if "BULL" in strat_raw:
@@ -184,15 +202,16 @@ class PriceProjectionEngine:
         else:
             raise ValueError(f"Nieznany typ strategii: {strat_raw}. Oczekiwano prefiksu BULL lub BEAR.")
 
-        k_long = float(strategy_row["LONG_K"])
-        k_short = float(strategy_row["SHORT_K"])
-        cost = abs(float(strategy_row["NET_COST"]))
-        max_win = float(strategy_row["MAX_WIN"])
+        k_long = cls._clean_numeric(strategy_row.get("LONG_K"), spot)
+        k_short = cls._clean_numeric(strategy_row.get("SHORT_K"), spot)
+        cost = abs(cls._clean_numeric(strategy_row.get("NET_COST"), 0.0))
+        max_win = cls._clean_numeric(strategy_row.get("MAX_WIN"), 0.0)
 
-        # 2. Bezpieczna obsluga progu rentownosci (odpornosc na None/NaN)
+        # 2. Bezpieczna obsluga progu rentownosci z fallbackiem
         raw_be = strategy_row.get("BREAKEVEN")
-        if raw_be is not None and not pd.isna(raw_be):
-            breakeven = float(raw_be)
+        cleaned_be = cls._clean_numeric(raw_be, default=-1.0)
+        if cleaned_be > 0.0:
+            breakeven = cleaned_be
         else:
             breakeven = (k_long + cost) if is_bull else (k_long - cost)
 
@@ -269,24 +288,27 @@ class PriceProjectionEngine:
         cls,
         spot: float,
         volatility: float,
-        drift: float,
-        strategy_row: Dict[str, Any]
+        drift: float = 0.0,
+        strategy_row: Dict[str, Any] = None
     ):
+        if strategy_row is None:
+            strategy_row = {}
+
         strat = str(strategy_row.get("STRATEGY") or strategy_row.get("STRAT") or "STRATEGIA").upper()
         exp = strategy_row.get("EXPIRY", "")
-        dte = float(strategy_row.get("DTE", 0.0))
-        k_long = strategy_row.get("LONG_K")
-        k_short = strategy_row.get("SHORT_K")
-        cost = strategy_row.get("NET_COST")
-        max_win = strategy_row.get("MAX_WIN")
-        rr = strategy_row.get("RR_RATIO")
+        dte = cls._clean_numeric(strategy_row.get("DTE"), 0.0)
+        k_long = strategy_row.get("LONG_K", "N/A")
+        k_short = strategy_row.get("SHORT_K", "N/A")
+        cost = strategy_row.get("NET_COST", "N/A")
+        max_win = strategy_row.get("MAX_WIN", "N/A")
+        rr = strategy_row.get("RR_RATIO", "N/A")
 
         print("\n========================================================================================================================")
         print(f"                       RAPORT PROJEKCJI PRAWDOPODOBIENSTWA DLA: {strat} {k_long} / {k_short} ({exp})")
         print("========================================================================================================================")
         print(f"Biezacy kurs SOL:  {spot:.2f} USD | Czas do wygasniecia (DTE): {dte:.1f} dni")
-        print(f"Uzyta zmiennosc:   {volatility * 100.0:.2f}% | Roczny dryf modelu (r - q): {drift * 100.0:.2f}%")
-        print(f"Parametry pozycji: Koszt: {cost} USD | Max Zysk: {max_win} USD | Stosunek R/R: {rr}")
+        print(f"Uzyta zmiennosc:   {volatility * 100.0:.2f}% | Roczny dryf projekcji (miara P): {drift * 100.0:.2f}%")
+        print(f"Parametry pozycji: Koszt: {cost} | Max Zysk: {max_win} | Stosunek R/R: {rr}")
         print("------------------------------------------------------------------------------------------------------------------------")
 
         # 1. Tabela stozka zmiennosci wycentrowana na medianie Ito

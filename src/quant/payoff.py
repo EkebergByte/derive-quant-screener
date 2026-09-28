@@ -379,8 +379,14 @@ class PayoffEngine:
         # 6. Analityczne Breakevens
         breakevens = cls._find_exact_breakevens(legs, net_entry_cost)
 
-        # 7. Prawdopodobienstwo Zysku (PoP)
-        ref_iv = fair_iv if fair_iv is not None else float(legs[0].get("iv") or 0.60)
+        # 7. Prawdopodobieństwo Zysku (PoP) z uśrednionego IV obu nóg spreadu
+        leg_ivs = [float(l.get("iv")) for l in legs if l.get("iv") is not None and float(l.get("iv")) > 0.0]
+        if fair_iv is not None and fair_iv > 0.0:
+            ref_iv = fair_iv
+        elif leg_ivs:
+            ref_iv = sum(leg_ivs) / len(leg_ivs)
+        else:
+            ref_iv = 0.60
         pop = cls.calculate_pop(
             legs=legs,
             breakevens=breakevens,
